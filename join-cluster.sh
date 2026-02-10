@@ -91,15 +91,19 @@ fi
 
 echo "Fetching K3s token from $CONTROL_PLANE_IP via SSH..."
 echo "---------------------------------------------------"
-echo "NOTE: You may see Tailscale authentication prompts or be asked for your Control Panel password here."
+echo "NOTE: You may see Tailscale authentication prompts or be asked for your Control Plane password here."
 echo "---------------------------------------------------"
 
 # Create a secure temporary file
 TEMP_TOKEN_FILE=$(mktemp)
 
-# Run SSH interactively so all prompts are visible, and output the result to the temp file
-# We use sudo cat and redirect the output locally
-ssh -t "$SSH_USER@$CONTROL_PLANE_IP" "sudo cat /var/lib/rancher/k3s/server/node-token" > "$TEMP_TOKEN_FILE"
+# Step 1: Force a terminal (-t) and ask sudo to validate credentials (-v).
+# This prompts you cleanly on your screen and caches the sudo session on the Control Plane.
+ssh -t "$SSH_USER@$CONTROL_PLANE_IP" "sudo -v"
+
+# Step 2: Now that sudo is cached, we connect WITHOUT a terminal. 
+# Sudo won't prompt for a password, so the pure token text flows perfectly into your file.
+ssh "$SSH_USER@$CONTROL_PLANE_IP" "sudo cat /var/lib/rancher/k3s/server/node-token" > "$TEMP_TOKEN_FILE"
 
 # Read the file into the variable, stripping carriage returns and extra whitespace
 K3S_TOKEN=$(cat "$TEMP_TOKEN_FILE" | tr -d '\r' | xargs)
@@ -159,7 +163,7 @@ systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
 
 echo "Configuring logind to ignore lid switch..."
 sed -i 's/^#*HandleLidSwitch=.*/HandleLidSwitch=ignore/' /etc/systemd/logind.conf
-systemctl restart systemd-logind
+systemctl kill -s HUP systemd-logind
 
 if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ]; then
     echo "Applying bash prompt with git integration for $TARGET_USER..."
