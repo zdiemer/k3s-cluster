@@ -91,7 +91,7 @@ fi
 
 echo "Fetching K3s token from $CONTROL_PLANE_IP via SSH..."
 echo "---------------------------------------------------"
-echo "NOTE: You may see Tailscale authentication prompts or be asked for your ProDesk password here."
+echo "NOTE: You may see Tailscale authentication prompts or be asked for your Control Panel password here."
 echo "---------------------------------------------------"
 
 # Create a secure temporary file
