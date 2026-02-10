@@ -89,33 +89,27 @@ if [ -z "$SSH_USER" ]; then
     exit 1
 fi
 
+# Securely prompt for the remote user's password on your local machine
+read -s -p "Enter the sudo password for $SSH_USER on the Control Plane: " REMOTE_SUDO_PW
+echo "" # Add a newline since read -s suppresses the Enter key
+
 echo "Fetching K3s token from $CONTROL_PLANE_IP via SSH..."
-echo "---------------------------------------------------"
-echo "NOTE: You may see Tailscale authentication prompts or be asked for your Control Plane password here."
-echo "---------------------------------------------------"
 
-# Create a secure temporary file
-TEMP_TOKEN_FILE=$(mktemp)
+# 1. We echo the password and pipe it into the SSH command.
+# 2. StrictHostKeyChecking=accept-new prevents the script from hanging on first-time connections.
+# 3. sudo -S reads the piped password directly.
+# 4. 2>/dev/null hides the text "[sudo] password for zachd:" that tries to print out.
+K3S_TOKEN=$(echo "$REMOTE_SUDO_PW" | ssh -o StrictHostKeyChecking=accept-new "$SSH_USER@$CONTROL_PLANE_IP" "sudo -S cat /var/lib/rancher/k3s/server/node-token" 2>/dev/null | tr -d '\r' | xargs)
 
-# Step 1: Force a terminal (-t) and ask sudo to validate credentials (-v).
-# This prompts you cleanly on your screen and caches the sudo session on the Control Plane.
-ssh -t "$SSH_USER@$CONTROL_PLANE_IP" "sudo -v"
-
-# Step 2: Now that sudo is cached, we connect WITHOUT a terminal. 
-# Sudo won't prompt for a password, so the pure token text flows perfectly into your file.
-ssh "$SSH_USER@$CONTROL_PLANE_IP" "sudo cat /var/lib/rancher/k3s/server/node-token" > "$TEMP_TOKEN_FILE"
-
-# Read the file into the variable, stripping carriage returns and extra whitespace
-K3S_TOKEN=$(cat "$TEMP_TOKEN_FILE" | tr -d '\r' | xargs)
-
-# Clean up the temp file immediately
-rm "$TEMP_TOKEN_FILE"
+# Clear the password variable from memory immediately
+unset REMOTE_SUDO_PW
 
 if [ -z "$K3S_TOKEN" ]; then
     echo "Error: Failed to retrieve the K3s token."
-    exit 1
+    read -p "Paste the K3s Node Token manually: " K3S_TOKEN
+else
+    echo "[SUCCESS] Token retrieved."
 fi
-echo "[SUCCESS] Token retrieved."
 
 # --- Dynamic Resource Calculation ---
 CPU_CORES=$(nproc)
