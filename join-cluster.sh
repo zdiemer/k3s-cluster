@@ -94,24 +94,23 @@ echo "---------------------------------------------------"
 echo "NOTE: You may see Tailscale authentication prompts or be asked for your Control Panel password here."
 echo "---------------------------------------------------"
 
-# Create a secure temporary file
-TEMP_TOKEN_FILE=$(mktemp)
-
-# Run SSH interactively so all prompts are visible, and output the result to the temp file
-# We use sudo cat and redirect the output locally
-ssh -o BatchMode=no "$SSH_USER@$CONTROL_PLANE_IP" "sudo cat /var/lib/rancher/k3s/server/node-token" > "$TEMP_TOKEN_FILE"
-
-# Read the file into the variable, stripping carriage returns and extra whitespace
-K3S_TOKEN=$(cat "$TEMP_TOKEN_FILE" | tr -d '\r' | xargs)
-
-# Clean up the temp file immediately
-rm "$TEMP_TOKEN_FILE"
+# Force SSH to run the command, output the result, and immediately terminate the session
+# We use 'cat' directly if permissions allow, or 'sudo sh -c' to ensure it runs and exits
+K3S_TOKEN=$(ssh "$SSH_USER@$CONTROL_PLANE_IP" "sudo sh -c 'cat /var/lib/rancher/k3s/server/node-token; exit'" </dev/null 2>/dev/null | tr -d '\r' | xargs)
 
 if [ -z "$K3S_TOKEN" ]; then
-    echo "Error: Failed to retrieve the K3s token."
-    exit 1
+    echo "Error: Failed to retrieve the K3s token automatically."
+    echo "Please ensure you can SSH into $CONTROL_PLANE_IP and run 'sudo cat /var/lib/rancher/k3s/server/node-token'"
+    
+    # Fallback to manual entry if SSH fails or hangs
+    read -p "Paste the K3s Node Token manually: " K3S_TOKEN
+    if [ -z "$K3S_TOKEN" ]; then
+        echo "Error: Token is required to proceed."
+        exit 1
+    fi
+else
+    echo "[SUCCESS] Token retrieved automatically."
 fi
-echo "[SUCCESS] Token retrieved."
 
 # --- Dynamic Resource Calculation ---
 CPU_CORES=$(nproc)
