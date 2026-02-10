@@ -17,27 +17,6 @@ echo "          K3s Worker Node & NFS Setup"
 echo "=============================================================================="
 echo ""
 
-# --- Dynamic Resource Calculation ---
-CPU_CORES=$(nproc)
-TOTAL_MEM_GB=$(awk '/MemTotal/ {printf "%.0f", $2/1024/1024}' /proc/meminfo)
-
-LIMIT_BY_CPU=$((CPU_CORES * 10))
-LIMIT_BY_RAM=$((TOTAL_MEM_GB * 10))
-
-RECOMMENDED_PODS=$LIMIT_BY_CPU
-if [ "$LIMIT_BY_RAM" -lt "$RECOMMENDED_PODS" ]; then
-    RECOMMENDED_PODS=$LIMIT_BY_RAM
-fi
-
-if [ "$RECOMMENDED_PODS" -gt 110 ]; then RECOMMENDED_PODS=110; fi
-if [ "$RECOMMENDED_PODS" -lt 10 ]; then RECOMMENDED_PODS=10; fi
-
-echo "System Analysis:"
-echo "- CPU Cores: $CPU_CORES"
-echo "- Total RAM: ${TOTAL_MEM_GB}GB"
-echo "- Recommended Max Pods: $RECOMMENDED_PODS"
-echo ""
-
 # ------------------------------------------------------------------------------
 # 0. Tailscale Setup & Control Plane Selection
 # ------------------------------------------------------------------------------
@@ -111,14 +90,49 @@ if [ -z "$SSH_USER" ]; then
 fi
 
 echo "Fetching K3s token from $CONTROL_PLANE_IP via SSH..."
-# Suppress the password prompt if keys are used, otherwise it will ask once
-K3S_TOKEN=$(ssh -t "$SSH_USER@$CONTROL_PLANE_IP" "sudo cat /var/lib/rancher/k3s/server/node-token" 2>/dev/null | tr -d '\r')
+echo "---------------------------------------------------"
+echo "NOTE: You may see Tailscale authentication prompts or be asked for your ProDesk password here."
+echo "---------------------------------------------------"
+
+# Create a secure temporary file
+TEMP_TOKEN_FILE=$(mktemp)
+
+# Run SSH interactively so all prompts are visible, and output the result to the temp file
+# We use sudo cat and redirect the output locally
+ssh -t "$SSH_USER@$CONTROL_PLANE_IP" "sudo cat /var/lib/rancher/k3s/server/node-token" > "$TEMP_TOKEN_FILE"
+
+# Read the file into the variable, stripping carriage returns and extra whitespace
+K3S_TOKEN=$(cat "$TEMP_TOKEN_FILE" | tr -d '\r' | xargs)
+
+# Clean up the temp file immediately
+rm "$TEMP_TOKEN_FILE"
 
 if [ -z "$K3S_TOKEN" ]; then
-    echo "Error: Failed to retrieve the K3s token. Check your SSH connection and permissions."
+    echo "Error: Failed to retrieve the K3s token."
     exit 1
 fi
 echo "[SUCCESS] Token retrieved."
+
+# --- Dynamic Resource Calculation ---
+CPU_CORES=$(nproc)
+TOTAL_MEM_GB=$(awk '/MemTotal/ {printf "%.0f", $2/1024/1024}' /proc/meminfo)
+
+LIMIT_BY_CPU=$((CPU_CORES * 10))
+LIMIT_BY_RAM=$((TOTAL_MEM_GB * 10))
+
+RECOMMENDED_PODS=$LIMIT_BY_CPU
+if [ "$LIMIT_BY_RAM" -lt "$RECOMMENDED_PODS" ]; then
+    RECOMMENDED_PODS=$LIMIT_BY_RAM
+fi
+
+if [ "$RECOMMENDED_PODS" -gt 110 ]; then RECOMMENDED_PODS=110; fi
+if [ "$RECOMMENDED_PODS" -lt 10 ]; then RECOMMENDED_PODS=10; fi
+
+echo "System Analysis:"
+echo "- CPU Cores: $CPU_CORES"
+echo "- Total RAM: ${TOTAL_MEM_GB}GB"
+echo "- Recommended Max Pods: $RECOMMENDED_PODS"
+echo ""
 
 read -p "Enter the maximum number of pods for this node [Default: $RECOMMENDED_PODS]: " MAX_PODS
 MAX_PODS=${MAX_PODS:-$RECOMMENDED_PODS}
