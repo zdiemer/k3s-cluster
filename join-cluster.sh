@@ -99,7 +99,7 @@ TEMP_TOKEN_FILE=$(mktemp)
 
 # Run SSH interactively so all prompts are visible, and output the result to the temp file
 # We use sudo cat and redirect the output locally
-ssh -o BatchMode=no "$SSH_USER@$CONTROL_PLANE_IP" "sudo cat /var/lib/rancher/k3s/server/node-token" > "$TEMP_TOKEN_FILE"
+ssh -t "$SSH_USER@$CONTROL_PLANE_IP" "sudo cat /var/lib/rancher/k3s/server/node-token" > "$TEMP_TOKEN_FILE"
 
 # Read the file into the variable, stripping carriage returns and extra whitespace
 K3S_TOKEN=$(cat "$TEMP_TOKEN_FILE" | tr -d '\r' | xargs)
