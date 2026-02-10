@@ -18,32 +18,19 @@ echo "==========================================================================
 echo ""
 
 # --- Dynamic Resource Calculation ---
-# Calculate a recommended max pod limit based on available resources.
-# Rules: ~10 pods per CPU core, ~10 pods per GB RAM. Do not exceed 110.
-
 CPU_CORES=$(nproc)
-# Get total memory in MB, convert to GB
 TOTAL_MEM_GB=$(awk '/MemTotal/ {printf "%.0f", $2/1024/1024}' /proc/meminfo)
 
-# Calculate theoretical limits
 LIMIT_BY_CPU=$((CPU_CORES * 10))
 LIMIT_BY_RAM=$((TOTAL_MEM_GB * 10))
 
-# Find the lowest bottleneck
 RECOMMENDED_PODS=$LIMIT_BY_CPU
 if [ "$LIMIT_BY_RAM" -lt "$RECOMMENDED_PODS" ]; then
     RECOMMENDED_PODS=$LIMIT_BY_RAM
 fi
 
-# Enforce the Kubernetes hard limit of 110
-if [ "$RECOMMENDED_PODS" -gt 110 ]; then
-    RECOMMENDED_PODS=110
-fi
-
-# Ensure it doesn't calculate something absurdly low
-if [ "$RECOMMENDED_PODS" -lt 10 ]; then
-    RECOMMENDED_PODS=10
-fi
+if [ "$RECOMMENDED_PODS" -gt 110 ]; then RECOMMENDED_PODS=110; fi
+if [ "$RECOMMENDED_PODS" -lt 10 ]; then RECOMMENDED_PODS=10; fi
 
 echo "System Analysis:"
 echo "- CPU Cores: $CPU_CORES"
@@ -51,19 +38,90 @@ echo "- Total RAM: ${TOTAL_MEM_GB}GB"
 echo "- Recommended Max Pods: $RECOMMENDED_PODS"
 echo ""
 
-# --- Interactive Prompts ---
-read -p "Enter the Control Plane IP Address (e.g., 192.168.1.10): " CONTROL_PLANE_IP
-read -p "Enter the K3s Node Token: " K3S_TOKEN
-read -p "Enter the maximum number of pods for this node [Default: $RECOMMENDED_PODS]: " MAX_PODS
+# ------------------------------------------------------------------------------
+# 0. Tailscale Setup & Control Plane Selection
+# ------------------------------------------------------------------------------
+echo "--- Step 0: Tailscale Configuration ---"
 
-# Set default max pods if input is empty
-MAX_PODS=${MAX_PODS:-$RECOMMENDED_PODS}
+if ! command -v tailscale &> /dev/null; then
+    echo "Installing Tailscale..."
+    curl -fsSL https://tailscale.com/install.sh | sh
+else
+    echo "Tailscale is already installed."
+fi
 
-# Validate required inputs aren't empty
-if [ -z "$CONTROL_PLANE_IP" ] || [ -z "$K3S_TOKEN" ]; then
-    echo "Error: Both IP Address and Token are required."
+# Check if Tailscale is already connected
+if ! tailscale status &> /dev/null; then
+    read -p "Enter a Tailscale Auth Key (or press Enter to authenticate via browser): " TS_AUTH_KEY
+    if [ -n "$TS_AUTH_KEY" ]; then
+        echo "Authenticating Tailscale with Auth Key..."
+        tailscale up --authkey="$TS_AUTH_KEY"
+    else
+        echo "Starting Tailscale interactive authentication."
+        echo "Please click the link below to authenticate in your browser. The script will pause until you complete this step."
+        tailscale up
+    fi
+else
+    echo "Tailscale is already connected."
+fi
+
+echo ""
+echo "--- Step 0.5: Select Control Plane ---"
+echo "Fetching available machines on your Tailnet..."
+
+# Read tailscale status output, filtering out the header and offline machines (optional, but good for cleanliness)
+# Using mapfile to cleanly read lines into an array
+mapfile -t TAILSCALE_MACHINES < <(tailscale status | awk '/^[0-9]/ {print $1, $2}')
+
+if [ ${#TAILSCALE_MACHINES[@]} -eq 0 ]; then
+    echo "Error: No machines found on the Tailnet. Ensure Tailscale is connected."
     exit 1
 fi
+
+echo "Available Tailscale Machines:"
+# Print the array as a numbered menu
+for i in "${!TAILSCALE_MACHINES[@]}"; do
+    echo "$((i+1)). ${TAILSCALE_MACHINES[$i]}"
+done
+
+echo ""
+# Loop until a valid selection is made
+while true; do
+    read -p "Select the number corresponding to your Control Plane: " SELECTION
+    if [[ "$SELECTION" =~ ^[0-9]+$ ]] && [ "$SELECTION" -ge 1 ] && [ "$SELECTION" -le "${#TAILSCALE_MACHINES[@]}" ]; then
+        # Extract the IP address from the selected line
+        SELECTED_INDEX=$((SELECTION-1))
+        CONTROL_PLANE_IP=$(echo "${TAILSCALE_MACHINES[$SELECTED_INDEX]}" | awk '{print $1}')
+        CONTROL_PLANE_HOSTNAME=$(echo "${TAILSCALE_MACHINES[$SELECTED_INDEX]}" | awk '{print $2}')
+        echo "Selected Control Plane: $CONTROL_PLANE_HOSTNAME ($CONTROL_PLANE_IP)"
+        break
+    else
+        echo "Invalid selection. Please enter a number between 1 and ${#TAILSCALE_MACHINES[@]}."
+    fi
+done
+echo ""
+
+# --- Interactive Prompts (Continued) ---
+# SSH Auto-Fetch for the Token
+read -p "Enter your SSH username for $CONTROL_PLANE_HOSTNAME to auto-fetch the token via Tailscale: " SSH_USER
+
+if [ -z "$SSH_USER" ]; then
+    echo "Error: SSH Username is required."
+    exit 1
+fi
+
+echo "Fetching K3s token from $CONTROL_PLANE_IP via SSH..."
+# Suppress the password prompt if keys are used, otherwise it will ask once
+K3S_TOKEN=$(ssh -t "$SSH_USER@$CONTROL_PLANE_IP" "sudo cat /var/lib/rancher/k3s/server/node-token" 2>/dev/null | tr -d '\r')
+
+if [ -z "$K3S_TOKEN" ]; then
+    echo "Error: Failed to retrieve the K3s token. Check your SSH connection and permissions."
+    exit 1
+fi
+echo "[SUCCESS] Token retrieved."
+
+read -p "Enter the maximum number of pods for this node [Default: $RECOMMENDED_PODS]: " MAX_PODS
+MAX_PODS=${MAX_PODS:-$RECOMMENDED_PODS}
 
 # --- Configuration Variables ---
 NFS_SERVER_PATH="/mnt/shared_storage" 
@@ -75,8 +133,6 @@ set -e
 
 echo ""
 echo "Starting setup for NFS Client and K3s Worker Node..."
-echo "Target Control Plane: $CONTROL_PLANE_IP"
-echo "Max Pods Limit: $MAX_PODS"
 echo ""
 
 # ------------------------------------------------------------------------------
@@ -98,7 +154,7 @@ if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ]; then
     if ! grep -q "parse_git_branch" "$BASHRC_PATH"; then
         cat << 'EOF' >> "$BASHRC_PATH"
 
-# Prompt with Git branch visibility
+# Simplified prompt with Git branch visibility
 parse_git_branch() {
      git branch 2> /dev/null | sed -e '/^[^*]/d' -e 's/* \(.*\)/ (\1)/'
 }
@@ -126,7 +182,6 @@ if grep -q "$CONTROL_PLANE_IP:$NFS_SERVER_PATH" /etc/fstab; then
     echo "NFS entry already exists in /etc/fstab. Skipping."
 else
     echo "Adding NFS mount to /etc/fstab for persistence..."
-    # Using printf to safely append the line
     printf "%s:%s    %s   nfs auto,nofail,noatime,nolock,intr,tcp,actimeo=1800 0 0\n" "$CONTROL_PLANE_IP" "$NFS_SERVER_PATH" "$LOCAL_MOUNT_POINT" >> /etc/fstab
 fi
 
@@ -136,7 +191,6 @@ fi
 echo "--- Step 3: Joining K3s Cluster ---"
 
 echo "Downloading and running the K3s installation script..."
-# Pass the max-pods argument to the K3s installer
 curl -sfL https://get.k3s.io | K3S_URL="https://$CONTROL_PLANE_IP:6443" K3S_TOKEN="$K3S_TOKEN" sh -s - --kubelet-arg=max-pods="$MAX_PODS"
 
 # ------------------------------------------------------------------------------
@@ -154,7 +208,7 @@ if mountpoint -q "$LOCAL_MOUNT_POINT"; then
          echo "[SUCCESS] Write access to NFS share verified."
          rm "$TEST_FILE"
     else
-         echo "[WARNING] NFS share is mounted, but write access failed. Check permissions on the Control Plane."
+         echo "[WARNING] NFS share is mounted, but write access failed."
     fi
 else
     echo "[ERROR] NFS share failed to mount."
