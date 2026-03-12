@@ -173,15 +173,16 @@ fi
 if ! tailscale status &> /dev/null; then
     read -p "Enter a Tailscale Auth Key (or press Enter to authenticate via browser): " TS_AUTH_KEY
     if [ -n "$TS_AUTH_KEY" ]; then
-        echo "Authenticating Tailscale with Auth Key..."
-        tailscale up --authkey="$TS_AUTH_KEY"
+        echo "Authenticating Tailscale with Auth Key and enabling SSH..."
+        tailscale up --authkey="$TS_AUTH_KEY" --ssh
     else
-        echo "Starting Tailscale interactive authentication."
+        echo "Starting Tailscale interactive authentication..."
         echo "Please click the link below to authenticate in your browser. The script will pause until you complete this step."
-        tailscale up
+        tailscale up --ssh
     fi
 else
-    echo "Tailscale is already connected."
+    echo "Tailscale is already connected. Ensuring Tailscale SSH is enabled..."
+    tailscale up --ssh
 fi
 
 echo ""
@@ -333,6 +334,21 @@ for SETTING in HandleLidSwitch HandleLidSwitchDocked HandleLidSwitchExternalPowe
 done
 systemctl kill -s HUP systemd-logind
 
+# --- Battery health (for laptops) ---
+if [ -d /sys/class/power_supply/BAT0 ] || [ -d /sys/class/power_supply/BAT1 ]; then
+    echo "Laptop detected. Configuring battery health settings..."
+    apt-get install -y tlp
+    # Configure TLP to limit charge to 80% to preserve battery health
+    # Note: Threshold support depends on hardware (e.g., ThinkPads, some Dells/HPs)
+    if [ -f /etc/tlp.conf ]; then
+        sed -i 's/^#START_CHARGE_THRESH_BAT0=.*/START_CHARGE_THRESH_BAT0=75/' /etc/tlp.conf
+        sed -i 's/^#STOP_CHARGE_THRESH_BAT0=.*/STOP_CHARGE_THRESH_BAT0=80/' /etc/tlp.conf
+        sed -i 's/^#START_CHARGE_THRESH_BAT1=.*/START_CHARGE_THRESH_BAT1=75/' /etc/tlp.conf
+        sed -i 's/^#STOP_CHARGE_THRESH_BAT1=.*/STOP_CHARGE_THRESH_BAT1=80/' /etc/tlp.conf
+    fi
+    systemctl enable --now tlp
+fi
+
 # --- GRUB: console blanking & USB autosuspend ---
 echo "Configuring GRUB kernel parameters..."
 GRUB_FILE="/etc/default/grub"
@@ -384,13 +400,16 @@ EOF
 fi
 
 # ------------------------------------------------------------------------------
-# 7. NFS Client Setup
+# 7. Storage & Longhorn Prerequisites
 # ------------------------------------------------------------------------------
-echo "--- Step 7: Configuring NFS Client ---"
+echo "--- Step 7: Configuring Storage & Longhorn Prerequisites ---"
 
-echo "Installing nfs-common..."
+echo "Installing nfs-common, open-iscsi, jq, and btop..."
 apt-get update
-apt-get install -y nfs-common
+apt-get install -y nfs-common open-iscsi jq btop
+
+echo "Enabling and starting iscsid..."
+systemctl enable --now iscsid
 
 echo "Creating local mount directory at $LOCAL_MOUNT_POINT..."
 mkdir -p "$LOCAL_MOUNT_POINT"
