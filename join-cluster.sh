@@ -382,6 +382,18 @@ GOVERNOR="performance"
 CPUEOF
 systemctl restart cpufrequtils 2>/dev/null || cpufreq-set -g performance 2>/dev/null || true
 
+# --- OOM tuning ---
+echo "Configuring OOM behavior..."
+cat > /etc/sysctl.d/99-k3s-node.conf << 'SYSCTLEOF'
+# Let the OOM killer work rather than kernel panic
+vm.panic_on_oom=0
+# Kill the allocating task on OOM (keeps other processes alive)
+vm.oom_kill_allocating_task=1
+# No swap, so disable swappiness
+vm.swappiness=0
+SYSCTLEOF
+sysctl -p /etc/sysctl.d/99-k3s-node.conf
+
 # --- Bash prompt with git integration ---
 if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ]; then
     echo "Applying bash prompt with git integration for $TARGET_USER..."
@@ -436,6 +448,11 @@ cat > /etc/systemd/system/k3s-agent.service.d/tailscale.conf << 'DROPEOF'
 [Unit]
 After=tailscaled.service
 Wants=tailscaled.service
+
+[Service]
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=0
 DROPEOF
 systemctl daemon-reload
 
@@ -452,10 +469,90 @@ curl -sfL https://get.k3s.io | \
     --protect-kernel-defaults=false
 
 # ------------------------------------------------------------------------------
-# 9. Verification
+# 9. Watchdog Services
 # ------------------------------------------------------------------------------
 echo ""
-echo "--- Step 9: Verification ---"
+echo "--- Step 9: Installing Watchdog Services ---"
+
+# WiFi reconnect watchdog
+cat > /usr/local/bin/wifi-watchdog << 'WIFIEOF'
+#!/bin/bash
+IFACE=$(iw dev 2>/dev/null | awk '/Interface/{print $2}' | head -1)
+[ -z "$IFACE" ] && exit 0
+if ! ping -c 1 -W 3 8.8.8.8 &>/dev/null; then
+    logger -t wifi-watchdog "No connectivity on $IFACE — attempting reconnect"
+    nmcli device disconnect "$IFACE" 2>/dev/null || true
+    sleep 2
+    nmcli device connect "$IFACE" 2>/dev/null || true
+fi
+WIFIEOF
+chmod +x /usr/local/bin/wifi-watchdog
+
+cat > /etc/systemd/system/wifi-watchdog.service << 'WIFISVCEOF'
+[Unit]
+Description=WiFi connectivity watchdog
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/wifi-watchdog
+WIFISVCEOF
+
+cat > /etc/systemd/system/wifi-watchdog.timer << 'WIFITIMEOF'
+[Unit]
+Description=Run WiFi watchdog every 2 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+
+[Install]
+WantedBy=timers.target
+WIFITIMEOF
+
+systemctl enable --now wifi-watchdog.timer
+echo "WiFi watchdog installed."
+
+# Tailscale reconnect watchdog
+cat > /usr/local/bin/tailscale-watchdog << 'TSEOF'
+#!/bin/bash
+if ! tailscale status &>/dev/null; then
+    logger -t tailscale-watchdog "Tailscale unreachable — restarting tailscaled"
+    systemctl restart tailscaled
+fi
+TSEOF
+chmod +x /usr/local/bin/tailscale-watchdog
+
+cat > /etc/systemd/system/tailscale-watchdog.service << 'TSSVCEOF'
+[Unit]
+Description=Tailscale connectivity watchdog
+After=tailscaled.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/tailscale-watchdog
+TSSVCEOF
+
+cat > /etc/systemd/system/tailscale-watchdog.timer << 'TSTIMEOF'
+[Unit]
+Description=Run Tailscale watchdog every 2 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+
+[Install]
+WantedBy=timers.target
+TSTIMEOF
+
+systemctl enable --now tailscale-watchdog.timer
+echo "Tailscale watchdog installed."
+
+# ------------------------------------------------------------------------------
+# 10. Verification
+# ------------------------------------------------------------------------------
+echo ""
+echo "--- Step 10: Verification ---"
 
 echo "Verifying swap is disabled..."
 if [ "$(swapon --show | wc -l)" -eq 0 ]; then
