@@ -418,7 +418,7 @@ echo "--- Step 7: Configuring Storage & Longhorn Prerequisites ---"
 
 echo "Installing nfs-common, open-iscsi, jq, and btop..."
 apt-get update
-apt-get install -y nfs-common open-iscsi jq btop
+apt-get install -y nfs-common open-iscsi jq btop smartmontools
 
 echo "Enabling and starting iscsid..."
 systemctl enable --now iscsid
@@ -592,6 +592,13 @@ fi
 
 echo ""
 echo "=============================================================================="
+echo "Verifying smartctl is installed..." 
+if command -v smartctl &> /dev/null; then 
+    echo "[SUCCESS] smartctl is installed." 
+else 
+    echo "[WARNING] smartctl is not installed." 
+fi 
+
 echo "Setup and Verification Complete!"
 echo "Verify cluster status by running: sudo k3s kubectl get nodes on the Control Plane."
 echo "=============================================================================="
