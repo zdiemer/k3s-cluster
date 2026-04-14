@@ -338,15 +338,296 @@ systemctl kill -s HUP systemd-logind
 if [ -d /sys/class/power_supply/BAT0 ] || [ -d /sys/class/power_supply/BAT1 ]; then
     echo "Laptop detected. Configuring battery health settings..."
     apt-get install -y tlp
-    # Configure TLP to limit charge to 80% to preserve battery health
-    # Note: Threshold support depends on hardware (e.g., ThinkPads, some Dells/HPs)
+
+    # Set TLP charge thresholds in config (for hardware TLP natively supports)
     if [ -f /etc/tlp.conf ]; then
-        sed -i 's/^#START_CHARGE_THRESH_BAT0=.*/START_CHARGE_THRESH_BAT0=75/' /etc/tlp.conf
-        sed -i 's/^#STOP_CHARGE_THRESH_BAT0=.*/STOP_CHARGE_THRESH_BAT0=80/' /etc/tlp.conf
-        sed -i 's/^#START_CHARGE_THRESH_BAT1=.*/START_CHARGE_THRESH_BAT1=75/' /etc/tlp.conf
-        sed -i 's/^#STOP_CHARGE_THRESH_BAT1=.*/STOP_CHARGE_THRESH_BAT1=80/' /etc/tlp.conf
+        for VAR in START_CHARGE_THRESH_BAT0=75 STOP_CHARGE_THRESH_BAT0=80 \
+                   START_CHARGE_THRESH_BAT1=75 STOP_CHARGE_THRESH_BAT1=80; do
+            KEY="${VAR%%=*}"
+            if grep -q "^${KEY}=" /etc/tlp.conf; then
+                sed -i "s/^${KEY}=.*/${VAR}/" /etc/tlp.conf
+            elif grep -q "^#${KEY}=" /etc/tlp.conf; then
+                sed -i "s/^#${KEY}=.*/${VAR}/" /etc/tlp.conf
+            else
+                echo "$VAR" >> /etc/tlp.conf
+            fi
+        done
     fi
     systemctl enable --now tlp
+
+    CHARGE_CONFIGURED=false
+
+    # --- Dell SMBIOS battery control ---
+    # Dell laptops need smbios-battery-ctl for real charge limiting;
+    # sysfs threshold files accept writes but the firmware ignores them.
+    if dmidecode -s system-manufacturer 2>/dev/null | grep -qi dell; then
+        echo "Dell detected. Setting charge mode via SMBIOS..."
+        apt-get install -y smbios-utils 2>/dev/null
+        if command -v smbios-battery-ctl >/dev/null 2>&1; then
+            smbios-battery-ctl --set-charging-mode=custom 2>/dev/null
+            smbios-battery-ctl --set-custom-charge-interval 75 80 2>/dev/null
+            CFG=$(smbios-battery-ctl --get-charging-cfg 2>/dev/null)
+            if echo "$CFG" | grep -q "custom"; then
+                echo "[SUCCESS] Dell charge mode: custom (75-80%)"
+                CHARGE_CONFIGURED=true
+            else
+                echo "[WARNING] Dell SMBIOS charge config failed."
+            fi
+        fi
+    fi
+
+    # --- Direct sysfs thresholds (non-Dell hardware) ---
+    if [ "$CHARGE_CONFIGURED" = false ]; then
+        for BAT_PATH in /sys/class/power_supply/BAT0 /sys/class/power_supply/BAT1; do
+            [ -d "$BAT_PATH" ] || continue
+            START_FILE="$BAT_PATH/charge_control_start_threshold"
+            END_FILE="$BAT_PATH/charge_control_end_threshold"
+            if [ -f "$END_FILE" ] && [ -f "$START_FILE" ]; then
+                echo 80 > "$END_FILE" 2>/dev/null && \
+                echo 75 > "$START_FILE" 2>/dev/null && \
+                CHARGE_CONFIGURED=true && \
+                echo "[SUCCESS] Set charge thresholds on $(basename "$BAT_PATH"): 75-80%"
+            fi
+        done
+        if [ "$CHARGE_CONFIGURED" = true ]; then
+            cat > /etc/systemd/system/battery-threshold.service << 'BATEOF'
+[Unit]
+Description=Apply battery charge thresholds
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c '\
+  for bat in /sys/class/power_supply/BAT*; do \
+    [ -f "$bat/charge_control_end_threshold" ] || continue; \
+    echo 80 > "$bat/charge_control_end_threshold" 2>/dev/null; \
+    echo 75 > "$bat/charge_control_start_threshold" 2>/dev/null; \
+  done'
+
+[Install]
+WantedBy=multi-user.target
+BATEOF
+            systemctl enable battery-threshold.service
+            echo "Installed battery-threshold.service for boot persistence."
+        fi
+    fi
+
+    # --- Apple SMC BCLM + ACEN drain ---
+    # Intel Macs: BCLM caps charge level (persists in NVRAM), ACEN toggles
+    # AC power to force drain. Standard SMC write cmd (0x02) is firmware-locked;
+    # cmd 0x11 works. Requires a kernel module since the applesmc driver
+    # doesn't expose key writes via sysfs.
+    if [ "$CHARGE_CONFIGURED" = false ] \
+        && [ -d /sys/devices/platform/applesmc.768 ]; then
+        echo "Apple SMC detected. Setting BCLM charge limit via kernel module..."
+        SMC_BUILD_DIR=$(mktemp -d)
+        cat > "$SMC_BUILD_DIR/smc_rw.c" << 'SMCEOF'
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/ioport.h>
+#include <linux/io.h>
+#include <linux/delay.h>
+
+#define SMC_PORT_BASE 0x0300
+#define SMC_PORT_DATA 0x0300
+#define SMC_PORT_CMD  0x0304
+#define SMC_NUM_PORTS 32
+#define SMC_CMD_WRITE 0x11
+#define SMC_CMD_READ  0x10
+#define SMC_MAX_WAIT  50000
+
+static char *key = "BCLM";
+module_param(key, charp, 0);
+static int value = 80;
+module_param(value, int, 0);
+
+static int wait_status(u8 mask, u8 val)
+{
+	int i; u8 s = 0;
+	for (i = 0; i < SMC_MAX_WAIT; i++) {
+		s = inb(SMC_PORT_CMD);
+		if ((s & mask) == val) return 0;
+		udelay(10);
+	}
+	return -EIO;
+}
+
+static int smc_send_byte(u8 c, u16 port)
+{
+	int ret = wait_status(0x02, 0x00);
+	if (ret) return ret;
+	outb(c, port);
+	return 0;
+}
+
+static int smc_rw(u8 cmd, const char *k, u8 *buf, u8 l, int is_read)
+{
+	int i, ret;
+	ret = smc_send_byte(cmd, SMC_PORT_CMD);
+	if (ret) return ret;
+	for (i = 0; i < 4; i++) {
+		ret = smc_send_byte(k[i], SMC_PORT_DATA);
+		if (ret) return ret;
+	}
+	ret = smc_send_byte(l, SMC_PORT_DATA);
+	if (ret) return ret;
+	for (i = 0; i < l; i++) {
+		if (is_read) {
+			ret = wait_status(0x01, 0x01);
+			if (ret) return ret;
+			buf[i] = inb(SMC_PORT_DATA);
+		} else {
+			ret = smc_send_byte(buf[i], SMC_PORT_DATA);
+			if (ret) return ret;
+		}
+	}
+	return 0;
+}
+
+static int __init smc_init(void)
+{
+	u8 buf[1], check[1] = {0};
+	unsigned long flags;
+	char k[5] = {0};
+
+	if (value < 0 || value > 100) return -EINVAL;
+	strscpy(k, key, 5);
+
+	if (!request_region(SMC_PORT_BASE, SMC_NUM_PORTS, "smc_rw"))
+		return -EBUSY;
+
+	buf[0] = (u8)value;
+	local_irq_save(flags);
+
+	smc_rw(SMC_CMD_READ, k, check, 1, 1);
+	pr_info("smc_rw: %s before = %d\n", k, check[0]);
+	udelay(500);
+
+	smc_rw(SMC_CMD_WRITE, k, buf, 1, 0);
+	udelay(500);
+
+	smc_rw(SMC_CMD_READ, k, check, 1, 1);
+	pr_info("smc_rw: %s after = %d %s\n", k, check[0],
+		check[0] == (u8)value ? "SUCCESS" : "UNCHANGED");
+
+	local_irq_restore(flags);
+	release_region(SMC_PORT_BASE, SMC_NUM_PORTS);
+	return -EAGAIN;
+}
+
+static void __exit smc_exit(void) {}
+module_init(smc_init);
+module_exit(smc_exit);
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Write Apple SMC key via IO ports (cmd 0x11)");
+SMCEOF
+
+        cat > "$SMC_BUILD_DIR/Makefile" << 'SMCMKEOF'
+obj-m := smc_rw.o
+KDIR := /lib/modules/$(shell uname -r)/build
+all:
+	make -C $(KDIR) M=$(PWD) modules
+SMCMKEOF
+
+        HEADERS_PKG="linux-headers-$(uname -r)"
+        if ! dpkg -l | grep -q "$HEADERS_PKG"; then
+            echo "Installing kernel headers for module build..."
+            apt-get install -y "$HEADERS_PKG"
+        fi
+
+        if make -C "$SMC_BUILD_DIR" 2>/dev/null; then
+            SMC_MOD="$SMC_BUILD_DIR/smc_rw.ko"
+
+            # Helper to load the module for a single key write
+            smc_write_key() {
+                rmmod applesmc 2>/dev/null; sleep 1
+                insmod "$SMC_MOD" key="$1" value="$2" 2>/dev/null
+                modprobe applesmc 2>/dev/null
+            }
+
+            # Set BCLM (charge level max, persists in NVRAM)
+            smc_write_key BCLM 80
+            RESULT=$(dmesg | grep "smc_rw: BCLM after" | tail -1)
+            if echo "$RESULT" | grep -q "SUCCESS"; then
+                echo "[SUCCESS] Apple SMC BCLM set to 80%."
+                CHARGE_CONFIGURED=true
+            else
+                echo "[WARNING] SMC BCLM write did not take effect."
+            fi
+
+            # Install the compiled module for the drain service to use
+            if [ "$CHARGE_CONFIGURED" = true ]; then
+                cp "$SMC_MOD" /usr/lib/modules/smc_rw.ko
+
+                # Drain service: toggles ACEN (AC enable) to drain battery
+                # down to the BCLM target. BCLM alone only caps charging —
+                # it doesn't actively drain. This runs at boot and periodically
+                # to bring the battery in line with BCLM.
+                cat > /usr/local/bin/apple-battery-drain << 'DRAINEOF'
+#!/bin/bash
+# Only run on Apple hardware with the SMC module available
+[ -d /sys/devices/platform/applesmc.768 ] || exit 0
+[ -f /usr/lib/modules/smc_rw.ko ] || exit 0
+
+BCLM_TARGET=80
+BAT=/sys/class/power_supply/BAT0
+[ -d "$BAT" ] || exit 0
+
+DESIGN=$(cat "$BAT/charge_full_design" 2>/dev/null) || exit 0
+NOW=$(cat "$BAT/charge_now" 2>/dev/null) || exit 0
+TARGET_MAH=$(( DESIGN * BCLM_TARGET / 100 ))
+
+if [ "$NOW" -le "$TARGET_MAH" ]; then
+    logger -t apple-battery-drain "Charge $NOW <= target $TARGET_MAH mAh, ensuring AC enabled"
+    rmmod applesmc 2>/dev/null; sleep 1
+    insmod /usr/lib/modules/smc_rw.ko key=ACEN value=1 2>/dev/null
+    modprobe applesmc 2>/dev/null
+    exit 0
+fi
+
+logger -t apple-battery-drain "Charge $NOW > target $TARGET_MAH mAh, disabling AC to drain"
+rmmod applesmc 2>/dev/null; sleep 1
+insmod /usr/lib/modules/smc_rw.ko key=ACEN value=0 2>/dev/null
+modprobe applesmc 2>/dev/null
+DRAINEOF
+                chmod +x /usr/local/bin/apple-battery-drain
+
+                cat > /etc/systemd/system/apple-battery-drain.service << 'DRAINSVCEOF'
+[Unit]
+Description=Drain Apple MacBook battery to BCLM target
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/apple-battery-drain
+DRAINSVCEOF
+
+                cat > /etc/systemd/system/apple-battery-drain.timer << 'DRAINTMEOF'
+[Unit]
+Description=Check Apple battery drain every 10 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
+DRAINTMEOF
+
+                systemctl daemon-reload
+                systemctl enable --now apple-battery-drain.timer
+                echo "Installed apple-battery-drain service (checks every 10min)."
+            fi
+        else
+            echo "[WARNING] Failed to build SMC kernel module. Install kernel headers."
+        fi
+        rm -rf "$SMC_BUILD_DIR"
+    fi
+
+    if [ "$CHARGE_CONFIGURED" = false ]; then
+        echo "[INFO] No charge control support — thresholds depend on TLP or BIOS."
+    fi
 fi
 
 # --- GRUB: console blanking & USB autosuspend ---
@@ -463,9 +744,11 @@ curl -sfL https://get.k3s.io | \
     K3S_NODE_NAME="$K3S_NODE_NAME" \
     sh -s - \
     --kubelet-arg=max-pods="$MAX_PODS" \
-    --kubelet-arg=eviction-hard="memory.available<256Mi,nodefs.available<1Gi" \
+    --kubelet-arg=eviction-hard="memory.available<512Mi,nodefs.available<1Gi" \
+    --kubelet-arg=eviction-soft="memory.available<768Mi,nodefs.available<2Gi" \
+    --kubelet-arg=eviction-soft-grace-period="memory.available=30s,nodefs.available=1m" \
     --kubelet-arg=kube-reserved="cpu=100m,memory=256Mi" \
-    --kubelet-arg=system-reserved="cpu=100m,memory=256Mi" \
+    --kubelet-arg=system-reserved="cpu=100m,memory=512Mi" \
     --protect-kernel-defaults=false
 
 # ------------------------------------------------------------------------------
@@ -547,6 +830,59 @@ TSTIMEOF
 
 systemctl enable --now tailscale-watchdog.timer
 echo "Tailscale watchdog installed."
+
+# Battery temperature watchdog (laptops only)
+# On Macs and some other laptops, software charge limiting isn't possible from
+# Linux. This watchdog monitors battery temperature to catch swelling or thermal
+# runaway — the actual fire hazard — and shuts down safely before it's dangerous.
+if [ -f /sys/class/power_supply/BAT0/temp ] || [ -f /sys/class/power_supply/BAT1/temp ]; then
+    cat > /usr/local/bin/battery-watchdog << 'BATWDEOF'
+#!/bin/bash
+WARN_TEMP=450   # 45.0°C — elevated, log warning
+CRIT_TEMP=550   # 55.0°C — dangerous, shut down
+
+for bat in /sys/class/power_supply/BAT*; do
+    [ -f "$bat/temp" ] || continue
+    temp=$(cat "$bat/temp" 2>/dev/null) || continue
+    name=$(basename "$bat")
+
+    if [ "$temp" -ge "$CRIT_TEMP" ] 2>/dev/null; then
+        logger -t battery-watchdog -p daemon.crit \
+            "CRITICAL: $name temperature ${temp} ($(awk "BEGIN{printf \"%.1f\", $temp/10}")°C) — initiating shutdown"
+        shutdown now "Battery temperature critical"
+    elif [ "$temp" -ge "$WARN_TEMP" ] 2>/dev/null; then
+        logger -t battery-watchdog -p daemon.warning \
+            "WARNING: $name temperature ${temp} ($(awk "BEGIN{printf \"%.1f\", $temp/10}")°C)"
+    fi
+done
+BATWDEOF
+    chmod +x /usr/local/bin/battery-watchdog
+
+    cat > /etc/systemd/system/battery-watchdog.service << 'BATWDSVCEOF'
+[Unit]
+Description=Battery temperature safety watchdog
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/battery-watchdog
+BATWDSVCEOF
+
+    cat > /etc/systemd/system/battery-watchdog.timer << 'BATWDTIMEOF'
+[Unit]
+Description=Run battery temperature watchdog every 2 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+
+[Install]
+WantedBy=timers.target
+BATWDTIMEOF
+
+    systemctl enable --now battery-watchdog.timer
+    echo "Battery temperature watchdog installed."
+fi
 
 # ------------------------------------------------------------------------------
 # 10. Verification
