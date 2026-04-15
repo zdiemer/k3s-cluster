@@ -1,9 +1,10 @@
 #!/bin/bash
 
 # ==============================================================================
-# Kubernetes Worker Node & NFS Client Setup Script
+# Kubernetes Node & NFS Client Setup Script
 # ==============================================================================
 # Run this script on new machines to join them to the cluster and mount the NAS.
+# Supports joining as either a worker (agent) or control plane (server) node.
 # Requires root privileges (run with sudo).
 #
 # Usage: sudo ./join-cluster.sh [--driver-cache /path/to/debs]
@@ -31,7 +32,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 echo "=============================================================================="
-echo "          K3s Worker Node & NFS Setup"
+echo "          K3s Cluster Node Setup"
 echo "=============================================================================="
 echo ""
 
@@ -222,6 +223,37 @@ done
 echo ""
 
 # ------------------------------------------------------------------------------
+# 2b. Node Role Selection
+# ------------------------------------------------------------------------------
+echo "--- Step 2b: Node Role ---"
+echo ""
+echo "How should this node join the cluster?"
+echo "  1. Worker (agent) — runs workloads only"
+echo "  2. Control Plane (server) — runs etcd + API server + workloads"
+echo ""
+echo "NOTE: Joining as a control plane node requires the existing control plane"
+echo "      to be running with --cluster-init (embedded etcd)."
+echo ""
+
+while true; do
+    read -p "Select node role [1]: " ROLE_SELECTION
+    ROLE_SELECTION=${ROLE_SELECTION:-1}
+    if [ "$ROLE_SELECTION" = "1" ]; then
+        NODE_ROLE="agent"
+        echo "This node will join as a Worker (agent)."
+        break
+    elif [ "$ROLE_SELECTION" = "2" ]; then
+        NODE_ROLE="server"
+        echo "This node will join as a Control Plane (server)."
+        break
+    else
+        echo "Invalid selection. Please enter 1 or 2."
+    fi
+done
+
+echo ""
+
+# ------------------------------------------------------------------------------
 # 3. SSH Token Fetch
 # ------------------------------------------------------------------------------
 echo "--- Step 3: Fetching K3s Token ---"
@@ -307,7 +339,7 @@ fi
 K3S_NODE_NAME="$NEW_HOSTNAME"
 
 echo ""
-echo "Starting setup for NFS Client and K3s Worker Node..."
+echo "Starting setup for NFS Client and K3s ${NODE_ROLE} node..."
 echo ""
 
 # ------------------------------------------------------------------------------
@@ -722,10 +754,16 @@ fi
 # ------------------------------------------------------------------------------
 echo "--- Step 8: Joining K3s Cluster ---"
 
-# Create systemd drop-in so k3s-agent waits for Tailscale
+# Create systemd drop-in so k3s waits for Tailscale
+if [ "$NODE_ROLE" = "server" ]; then
+    K3S_SERVICE="k3s"
+else
+    K3S_SERVICE="k3s-agent"
+fi
+
 echo "Creating systemd drop-in for Tailscale dependency..."
-mkdir -p /etc/systemd/system/k3s-agent.service.d
-cat > /etc/systemd/system/k3s-agent.service.d/tailscale.conf << 'DROPEOF'
+mkdir -p /etc/systemd/system/${K3S_SERVICE}.service.d
+cat > /etc/systemd/system/${K3S_SERVICE}.service.d/tailscale.conf << 'DROPEOF'
 [Unit]
 After=tailscaled.service
 Wants=tailscaled.service
@@ -738,18 +776,33 @@ DROPEOF
 systemctl daemon-reload
 
 echo "Downloading and running the K3s installation script..."
-curl -sfL https://get.k3s.io | \
-    K3S_URL="https://$CONTROL_PLANE_IP:6443" \
-    K3S_TOKEN="$K3S_TOKEN" \
-    K3S_NODE_NAME="$K3S_NODE_NAME" \
-    sh -s - \
-    --kubelet-arg=max-pods="$MAX_PODS" \
-    --kubelet-arg=eviction-hard="memory.available<512Mi,nodefs.available<1Gi" \
-    --kubelet-arg=eviction-soft="memory.available<768Mi,nodefs.available<2Gi" \
-    --kubelet-arg=eviction-soft-grace-period="memory.available=30s,nodefs.available=1m" \
-    --kubelet-arg=kube-reserved="cpu=100m,memory=256Mi" \
-    --kubelet-arg=system-reserved="cpu=100m,memory=512Mi" \
-    --protect-kernel-defaults=false
+if [ "$NODE_ROLE" = "server" ]; then
+    curl -sfL https://get.k3s.io | \
+        K3S_TOKEN="$K3S_TOKEN" \
+        K3S_NODE_NAME="$K3S_NODE_NAME" \
+        sh -s - server \
+        --server "https://$CONTROL_PLANE_IP:6443" \
+        --kubelet-arg=max-pods="$MAX_PODS" \
+        --kubelet-arg=eviction-hard="memory.available<512Mi,nodefs.available<1Gi" \
+        --kubelet-arg=eviction-soft="memory.available<768Mi,nodefs.available<2Gi" \
+        --kubelet-arg=eviction-soft-grace-period="memory.available=30s,nodefs.available=1m" \
+        --kubelet-arg=kube-reserved="cpu=100m,memory=256Mi" \
+        --kubelet-arg=system-reserved="cpu=100m,memory=512Mi" \
+        --protect-kernel-defaults=false
+else
+    curl -sfL https://get.k3s.io | \
+        K3S_URL="https://$CONTROL_PLANE_IP:6443" \
+        K3S_TOKEN="$K3S_TOKEN" \
+        K3S_NODE_NAME="$K3S_NODE_NAME" \
+        sh -s - \
+        --kubelet-arg=max-pods="$MAX_PODS" \
+        --kubelet-arg=eviction-hard="memory.available<512Mi,nodefs.available<1Gi" \
+        --kubelet-arg=eviction-soft="memory.available<768Mi,nodefs.available<2Gi" \
+        --kubelet-arg=eviction-soft-grace-period="memory.available=30s,nodefs.available=1m" \
+        --kubelet-arg=kube-reserved="cpu=100m,memory=256Mi" \
+        --kubelet-arg=system-reserved="cpu=100m,memory=512Mi" \
+        --protect-kernel-defaults=false
+fi
 
 # ------------------------------------------------------------------------------
 # 9. Watchdog Services
@@ -919,11 +972,11 @@ else
     echo "[ERROR] NFS share failed to mount."
 fi
 
-echo "Verifying K3s Agent Service..."
-if systemctl is-active --quiet k3s-agent; then
-    echo "[SUCCESS] K3s agent service is running."
+echo "Verifying K3s ${NODE_ROLE} service..."
+if systemctl is-active --quiet "$K3S_SERVICE"; then
+    echo "[SUCCESS] K3s ${NODE_ROLE} service is running."
 else
-    echo "[ERROR] K3s agent service is not running. Check logs with: journalctl -u k3s-agent"
+    echo "[ERROR] K3s ${NODE_ROLE} service is not running. Check logs with: journalctl -u $K3S_SERVICE"
 fi
 
 echo ""
@@ -936,5 +989,9 @@ else
 fi 
 
 echo "Setup and Verification Complete!"
-echo "Verify cluster status by running: sudo k3s kubectl get nodes on the Control Plane."
+if [ "$NODE_ROLE" = "server" ]; then
+    echo "This node joined as a control plane (server). Verify with: sudo k3s kubectl get nodes"
+else
+    echo "Verify cluster status by running: sudo k3s kubectl get nodes on the Control Plane."
+fi
 echo "=============================================================================="
