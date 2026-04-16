@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # ==============================================================================
-# Kubernetes Node & NFS Client Setup Script
+# Kubernetes Node Setup Script
 # ==============================================================================
-# Run this script on new machines to join them to the cluster and mount the NAS.
+# Run this script on new machines to join them to the cluster.
 # Supports joining as either a worker (agent) or control plane (server) node.
 # Requires root privileges (run with sudo).
 #
@@ -311,8 +311,6 @@ read -p "Enter the maximum number of pods for this node [Default: $RECOMMENDED_P
 MAX_PODS=${MAX_PODS:-$RECOMMENDED_PODS}
 
 # --- Configuration Variables ---
-NFS_SERVER_PATH="/mnt/shared_storage"
-LOCAL_MOUNT_POINT="/mnt/nfs_clientshare"
 TARGET_USER=${SUDO_USER:-$USER}
 
 # Exit immediately if a command exits with a non-zero status
@@ -339,7 +337,7 @@ fi
 K3S_NODE_NAME="$NEW_HOSTNAME"
 
 echo ""
-echo "Starting setup for NFS Client and K3s ${NODE_ROLE} node..."
+echo "Starting setup for K3s ${NODE_ROLE} node..."
 echo ""
 
 # ------------------------------------------------------------------------------
@@ -729,25 +727,12 @@ fi
 # ------------------------------------------------------------------------------
 echo "--- Step 7: Configuring Storage & Longhorn Prerequisites ---"
 
-echo "Installing nfs-common, open-iscsi, jq, and btop..."
+echo "Installing open-iscsi, jq, btop, and smartmontools..."
 apt-get update
-apt-get install -y nfs-common open-iscsi jq btop smartmontools
+apt-get install -y open-iscsi jq btop smartmontools
 
 echo "Enabling and starting iscsid..."
 systemctl enable --now iscsid
-
-echo "Creating local mount directory at $LOCAL_MOUNT_POINT..."
-mkdir -p "$LOCAL_MOUNT_POINT"
-
-echo "Mounting NFS share from $CONTROL_PLANE_IP:$NFS_SERVER_PATH..."
-mount -t nfs "$CONTROL_PLANE_IP:$NFS_SERVER_PATH" "$LOCAL_MOUNT_POINT"
-
-if grep -q "$CONTROL_PLANE_IP:$NFS_SERVER_PATH" /etc/fstab; then
-    echo "NFS entry already exists in /etc/fstab. Skipping."
-else
-    echo "Adding NFS mount to /etc/fstab for persistence..."
-    printf "%s:%s    %s   nfs auto,nofail,noatime,nolock,intr,tcp,actimeo=1800 0 0\n" "$CONTROL_PLANE_IP" "$NFS_SERVER_PATH" "$LOCAL_MOUNT_POINT" >> /etc/fstab
-fi
 
 # ------------------------------------------------------------------------------
 # 8. Join K3s Cluster
@@ -938,10 +923,92 @@ BATWDTIMEOF
 fi
 
 # ------------------------------------------------------------------------------
-# 10. Verification
+# 10. Headless & Resource Optimization
 # ------------------------------------------------------------------------------
 echo ""
-echo "--- Step 10: Verification ---"
+echo "--- Step 10: Headless & Resource Optimization ---"
+
+# --- Switch to multi-user (no GUI) on next boot ---
+CURRENT_TARGET=$(systemctl get-default)
+if [ "$CURRENT_TARGET" = "graphical.target" ]; then
+    echo "Switching default boot target to multi-user (headless)..."
+    echo "  (GUI remains active for this session; takes effect on next reboot)"
+    echo "  (To restore: sudo systemctl set-default graphical.target)"
+    systemctl set-default multi-user.target
+else
+    echo "Already booting to $CURRENT_TARGET."
+fi
+
+# --- Disable desktop services that aren't useful on a k8s node ---
+echo "Disabling unnecessary desktop services..."
+DISABLE_SERVICES=(
+    cups.service cups-browsed.service    # Printing
+    avahi-daemon.service                 # mDNS/Bonjour
+    ModemManager.service                 # Cellular modems
+    bluetooth.service                    # Bluetooth
+    switcheroo-control.service           # GPU switching
+    whoopsie.service                     # Ubuntu error reporting
+    kerneloops.service                   # Kernel oops reporting
+)
+for svc in "${DISABLE_SERVICES[@]}"; do
+    [[ "$svc" == \#* ]] && continue
+    if systemctl list-unit-files "$svc" &>/dev/null; then
+        systemctl disable --now "$svc" 2>/dev/null && echo "  Disabled $svc" || true
+    fi
+done
+
+# --- Remove snapd ---
+if command -v snap &>/dev/null; then
+    echo "Removing snapd (frees RAM, removes loopback mounts)..."
+    snap list 2>/dev/null | awk 'NR>1 {print $1}' | while read -r pkg; do
+        snap remove --purge "$pkg" 2>/dev/null || true
+    done
+    apt-get autopurge -y snapd 2>/dev/null || apt-get purge -y snapd
+    rm -rf /snap /var/snap /var/lib/snapd ~/snap
+    # Prevent snapd from being reinstalled as a dependency
+    cat > /etc/apt/preferences.d/no-snapd << 'NOSNAPEOF'
+Package: snapd
+Pin: release *
+Pin-Priority: -1
+NOSNAPEOF
+    echo "snapd removed."
+else
+    echo "snapd not installed."
+fi
+
+# --- Cap journald storage ---
+echo "Configuring journald storage limits..."
+mkdir -p /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/size-limit.conf << 'JRNLEOF'
+[Journal]
+SystemMaxUse=500M
+JRNLEOF
+systemctl restart systemd-journald
+
+# --- Ensure time sync ---
+echo "Ensuring time synchronization is active..."
+timedatectl set-ntp true 2>/dev/null || true
+if timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q "yes"; then
+    echo "[SUCCESS] NTP is synchronized."
+else
+    echo "[INFO] NTP enabled — may take a moment to synchronize."
+fi
+
+# --- CPU microcode ---
+echo "Installing CPU microcode updates..."
+if grep -q "GenuineIntel" /proc/cpuinfo; then
+    apt-get install -y intel-microcode
+elif grep -q "AuthenticAMD" /proc/cpuinfo; then
+    apt-get install -y amd64-microcode
+else
+    echo "Unknown CPU vendor — skipping microcode."
+fi
+
+# ------------------------------------------------------------------------------
+# 11. Verification
+# ------------------------------------------------------------------------------
+echo ""
+echo "--- Step 11: Verification ---"
 
 echo "Verifying swap is disabled..."
 if [ "$(swapon --show | wc -l)" -eq 0 ]; then
@@ -955,21 +1022,6 @@ if systemctl is-active --quiet tailscaled; then
     echo "[SUCCESS] Tailscale is running."
 else
     echo "[WARNING] Tailscale service is not running."
-fi
-
-echo "Verifying NFS Mount..."
-if mountpoint -q "$LOCAL_MOUNT_POINT"; then
-    echo "[SUCCESS] NFS share is successfully mounted at $LOCAL_MOUNT_POINT."
-
-    TEST_FILE="$LOCAL_MOUNT_POINT/.nfs_test_$(date +%s)"
-    if touch "$TEST_FILE" 2>/dev/null; then
-         echo "[SUCCESS] Write access to NFS share verified."
-         rm "$TEST_FILE"
-    else
-         echo "[WARNING] NFS share is mounted, but write access failed."
-    fi
-else
-    echo "[ERROR] NFS share failed to mount."
 fi
 
 echo "Verifying K3s ${NODE_ROLE} service..."
@@ -995,3 +1047,9 @@ else
     echo "Verify cluster status by running: sudo k3s kubectl get nodes on the Control Plane."
 fi
 echo "=============================================================================="
+
+echo ""
+echo "Rebooting in 10 seconds to apply all changes (headless mode, microcode, etc.)..."
+echo "The node will come back up via Tailscale SSH."
+sleep 10
+reboot
