@@ -372,7 +372,8 @@ if [ -d /sys/class/power_supply/BAT0 ] || [ -d /sys/class/power_supply/BAT1 ]; t
     # Set TLP charge thresholds in config (for hardware TLP natively supports)
     if [ -f /etc/tlp.conf ]; then
         for VAR in START_CHARGE_THRESH_BAT0=75 STOP_CHARGE_THRESH_BAT0=80 \
-                   START_CHARGE_THRESH_BAT1=75 STOP_CHARGE_THRESH_BAT1=80; do
+                   START_CHARGE_THRESH_BAT1=75 STOP_CHARGE_THRESH_BAT1=80 \
+                   TLP_DEFAULT_MODE=AC TLP_PERSISTENT_DEFAULT=1; do
             KEY="${VAR%%=*}"
             if grep -q "^${KEY}=" /etc/tlp.conf; then
                 sed -i "s/^${KEY}=.*/${VAR}/" /etc/tlp.conf
@@ -658,6 +659,57 @@ DRAINTMEOF
     if [ "$CHARGE_CONFIGURED" = false ]; then
         echo "[INFO] No charge control support — thresholds depend on TLP or BIOS."
     fi
+
+    # --- Thermal management (Intel) ---
+    if grep -q "GenuineIntel" /proc/cpuinfo; then
+        echo "Installing thermald for Intel thermal management..."
+        apt-get install -y thermald
+        systemctl enable --now thermald
+    fi
+
+    # --- Block bluetooth radio ---
+    echo "Blocking bluetooth radio..."
+    rfkill block bluetooth 2>/dev/null || true
+    cat > /etc/modprobe.d/blacklist-bluetooth.conf << 'BTEOF'
+blacklist btusb
+blacklist bluetooth
+BTEOF
+
+    # --- Wake-on-LAN on wired NICs ---
+    echo "Installing Wake-on-LAN enablement service..."
+    cat > /etc/systemd/system/wol-enable.service << 'WOLEOF'
+[Unit]
+Description=Enable Wake-on-LAN on wired interfaces
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c 'for i in $(ls /sys/class/net); do [ -d "/sys/class/net/$i/wireless" ] && continue; case "$i" in lo|tailscale*|docker*|cni*|flannel*|veth*) continue;; esac; ethtool "$i" 2>/dev/null | grep -q "Supports Wake-on" && ethtool -s "$i" wol g 2>/dev/null && logger -t wol-enable "WoL enabled on $i"; done'
+
+[Install]
+WantedBy=multi-user.target
+WOLEOF
+    systemctl daemon-reload
+    systemctl enable --now wol-enable.service 2>/dev/null || true
+
+    # --- NVMe APST (opt-in; applied via GRUB below) ---
+    DISABLE_APST=""
+    if ls /dev/nvme*n1 &>/dev/null; then
+        if dmesg 2>/dev/null | grep -qiE "nvme.*(reset|controller.*(timed out|failure))"; then
+            echo "[NOTICE] NVMe reset errors detected in dmesg."
+            APST_DEFAULT="y"
+        else
+            APST_DEFAULT="n"
+        fi
+        read -p "Disable NVMe APST? Fixes resets on some SSDs, costs ~1W idle. [y/N, default: $APST_DEFAULT]: " DISABLE_APST
+        DISABLE_APST=${DISABLE_APST:-$APST_DEFAULT}
+    fi
+
+    # --- Hardware sensors ---
+    echo "Installing lm-sensors..."
+    apt-get install -y lm-sensors
+    yes | sensors-detect --auto 2>/dev/null || true
 fi
 
 # --- GRUB: console blanking & USB autosuspend ---
@@ -665,8 +717,11 @@ echo "Configuring GRUB kernel parameters..."
 GRUB_FILE="/etc/default/grub"
 GRUB_CHANGED=false
 
-for PARAM in "consoleblank=0" "usbcore.autosuspend=-1"; do
-    PARAM_NAME="${PARAM%%=*}"
+GRUB_PARAMS=("consoleblank=0" "usbcore.autosuspend=-1")
+if [[ "${DISABLE_APST:-n}" =~ ^[Yy]$ ]]; then
+    GRUB_PARAMS+=("nvme_core.default_ps_max_latency_us=0")
+fi
+for PARAM in "${GRUB_PARAMS[@]}"; do
     if ! grep -q "$PARAM" "$GRUB_FILE"; then
         sed -i "s/\(GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*\)\"/\1 ${PARAM}\"/" "$GRUB_FILE"
         GRUB_CHANGED=true
@@ -693,17 +748,39 @@ GOVERNOR="performance"
 CPUEOF
 systemctl restart cpufrequtils 2>/dev/null || cpufreq-set -g performance 2>/dev/null || true
 
-# --- OOM tuning ---
-echo "Configuring OOM behavior..."
+# --- Kernel tuning ---
+echo "Configuring kernel sysctls..."
 cat > /etc/sysctl.d/99-k3s-node.conf << 'SYSCTLEOF'
-# Let the OOM killer work rather than kernel panic
+# OOM: use killer rather than panic, kill offender not arbitrary victim
 vm.panic_on_oom=0
-# Kill the allocating task on OOM (keeps other processes alive)
 vm.oom_kill_allocating_task=1
-# No swap, so disable swappiness
+# No swap
 vm.swappiness=0
+
+# k8s workload limits — defaults too low for many-pod nodes
+fs.inotify.max_user_instances=8192
+fs.inotify.max_user_watches=262144
+fs.file-max=1048576
+vm.max_map_count=262144
+net.core.somaxconn=32768
+net.ipv4.tcp_max_syn_backlog=16384
+net.netfilter.nf_conntrack_max=262144
+
+# Resilience: auto-reboot 10s after kernel panic
+kernel.panic=10
 SYSCTLEOF
 sysctl -p /etc/sysctl.d/99-k3s-node.conf
+
+# --- File descriptor & process limits ---
+echo "Setting nofile/nproc limits..."
+cat > /etc/security/limits.d/99-k3s.conf << 'LIMITSEOF'
+*       soft    nofile  1048576
+*       hard    nofile  1048576
+root    soft    nofile  1048576
+root    hard    nofile  1048576
+*       soft    nproc   unlimited
+*       hard    nproc   unlimited
+LIMITSEOF
 
 # --- Bash prompt with git integration ---
 if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ]; then
@@ -723,16 +800,16 @@ EOF
 fi
 
 # ------------------------------------------------------------------------------
-# 7. Storage & Longhorn Prerequisites
+# 7. Tools & Diagnostics
 # ------------------------------------------------------------------------------
-echo "--- Step 7: Configuring Storage & Longhorn Prerequisites ---"
+echo "--- Step 7: Tools & Diagnostics ---"
 
-echo "Installing open-iscsi, jq, btop, and smartmontools..."
+echo "Installing diagnostic tools and storage utilities..."
 apt-get update
-apt-get install -y open-iscsi jq btop smartmontools
-
-echo "Enabling and starting iscsid..."
-systemctl enable --now iscsid
+apt-get install -y \
+    jq btop smartmontools \
+    htop iotop iftop tcpdump lsof ncdu \
+    dnsutils net-tools rsync ethtool conntrack
 
 # ------------------------------------------------------------------------------
 # 8. Join K3s Cluster
@@ -760,6 +837,19 @@ StartLimitIntervalSec=0
 DROPEOF
 systemctl daemon-reload
 
+# Scale kube/system-reserved to node RAM so kubelet advertises honest allocatable
+if [ "$TOTAL_MEM_GB" -le 8 ]; then
+    KUBE_RESERVED="cpu=100m,memory=384Mi"
+    SYSTEM_RESERVED="cpu=100m,memory=640Mi"
+elif [ "$TOTAL_MEM_GB" -le 16 ]; then
+    KUBE_RESERVED="cpu=100m,memory=512Mi"
+    SYSTEM_RESERVED="cpu=100m,memory=768Mi"
+else
+    KUBE_RESERVED="cpu=200m,memory=768Mi"
+    SYSTEM_RESERVED="cpu=200m,memory=1Gi"
+fi
+echo "Kubelet reservations: kube=$KUBE_RESERVED, system=$SYSTEM_RESERVED"
+
 echo "Downloading and running the K3s installation script..."
 if [ "$NODE_ROLE" = "server" ]; then
     curl -sfL https://get.k3s.io | \
@@ -771,8 +861,8 @@ if [ "$NODE_ROLE" = "server" ]; then
         --kubelet-arg=eviction-hard="memory.available<512Mi,nodefs.available<1Gi" \
         --kubelet-arg=eviction-soft="memory.available<768Mi,nodefs.available<2Gi" \
         --kubelet-arg=eviction-soft-grace-period="memory.available=30s,nodefs.available=1m" \
-        --kubelet-arg=kube-reserved="cpu=100m,memory=256Mi" \
-        --kubelet-arg=system-reserved="cpu=100m,memory=512Mi" \
+        --kubelet-arg=kube-reserved="$KUBE_RESERVED" \
+        --kubelet-arg=system-reserved="$SYSTEM_RESERVED" \
         --protect-kernel-defaults=false
 else
     curl -sfL https://get.k3s.io | \
@@ -784,8 +874,8 @@ else
         --kubelet-arg=eviction-hard="memory.available<512Mi,nodefs.available<1Gi" \
         --kubelet-arg=eviction-soft="memory.available<768Mi,nodefs.available<2Gi" \
         --kubelet-arg=eviction-soft-grace-period="memory.available=30s,nodefs.available=1m" \
-        --kubelet-arg=kube-reserved="cpu=100m,memory=256Mi" \
-        --kubelet-arg=system-reserved="cpu=100m,memory=512Mi" \
+        --kubelet-arg=kube-reserved="$KUBE_RESERVED" \
+        --kubelet-arg=system-reserved="$SYSTEM_RESERVED" \
         --protect-kernel-defaults=false
 fi
 
@@ -981,9 +1071,33 @@ echo "Configuring journald storage limits..."
 mkdir -p /etc/systemd/journald.conf.d
 cat > /etc/systemd/journald.conf.d/size-limit.conf << 'JRNLEOF'
 [Journal]
-SystemMaxUse=500M
+SystemMaxUse=200M
 JRNLEOF
 systemctl restart systemd-journald
+
+# --- Container log rotation (via k3s config.yaml, merged on restart) ---
+echo "Configuring container log rotation..."
+mkdir -p /etc/rancher/k3s
+if [ ! -f /etc/rancher/k3s/config.yaml ] || ! grep -q "container-log-max" /etc/rancher/k3s/config.yaml; then
+    cat >> /etc/rancher/k3s/config.yaml << 'K3SCFGEOF'
+kubelet-arg:
+  - "container-log-max-size=10Mi"
+  - "container-log-max-files=3"
+K3SCFGEOF
+fi
+
+# --- fstrim timer for SSD longevity ---
+echo "Enabling weekly fstrim..."
+systemctl enable fstrim.timer 2>/dev/null || true
+
+# --- localepurge to strip unused locales ---
+echo "Installing localepurge..."
+echo "localepurge localepurge/nopurge multiselect en, en_US, en_US.UTF-8" | debconf-set-selections
+echo "localepurge localepurge/use-dpkg-feature boolean true" | debconf-set-selections
+echo "localepurge localepurge/none_selected boolean false" | debconf-set-selections
+echo "localepurge localepurge/verbose boolean false" | debconf-set-selections
+DEBIAN_FRONTEND=noninteractive apt-get install -y localepurge
+localepurge 2>/dev/null || true
 
 # --- Ensure time sync ---
 echo "Ensuring time synchronization is active..."
@@ -1003,6 +1117,39 @@ elif grep -q "AuthenticAMD" /proc/cpuinfo; then
 else
     echo "Unknown CPU vendor — skipping microcode."
 fi
+
+# --- GNOME desktop purge (opt-in) ---
+if dpkg -l 2>/dev/null | awk '{print $2}' | grep -qE '^(ubuntu-desktop|ubuntu-desktop-minimal|gnome-shell)$'; then
+    echo ""
+    read -p "Purge GNOME desktop packages? (frees ~2-3GB disk) [y/N]: " PURGE_GNOME
+    if [[ "$PURGE_GNOME" =~ ^[Yy]$ ]]; then
+        echo "Pinning network + firmware packages to prevent accidental removal..."
+        apt-mark manual network-manager 2>/dev/null || true
+        dpkg -l 'linux-firmware*' 2>/dev/null | awk '/^ii/{print $2}' | xargs -r apt-mark manual 2>/dev/null || true
+        dpkg -l 'network-manager-*' 2>/dev/null | awk '/^ii/{print $2}' | xargs -r apt-mark manual 2>/dev/null || true
+
+        echo "Packages that would be removed:"
+        apt-get -s purge ubuntu-desktop ubuntu-desktop-minimal gnome-shell 2>&1 | grep -E "^(Remv|Purg)" | head -40
+        echo ""
+        read -p "Proceed with purge? [y/N]: " PURGE_CONFIRM
+        if [[ "$PURGE_CONFIRM" =~ ^[Yy]$ ]]; then
+            apt-get -y purge ubuntu-desktop ubuntu-desktop-minimal gnome-shell 2>/dev/null || true
+            apt-get -y autoremove --purge 2>/dev/null || true
+            echo "[SUCCESS] GNOME packages purged."
+        fi
+    fi
+fi
+
+# --- Final cleanup ---
+echo ""
+echo "Apt cleanup — packages eligible for autoremove:"
+apt-get -s autoremove --purge 2>&1 | grep -E "^(Remv|Purg)" | head -30 || echo "  (none)"
+read -p "Run autoremove --purge? [Y/n]: " AUTOREMOVE_CONFIRM
+AUTOREMOVE_CONFIRM=${AUTOREMOVE_CONFIRM:-y}
+if [[ "$AUTOREMOVE_CONFIRM" =~ ^[Yy]$ ]]; then
+    apt-get -y autoremove --purge 2>/dev/null || true
+fi
+apt-get clean
 
 # ------------------------------------------------------------------------------
 # 11. Verification
