@@ -7,7 +7,7 @@
 # Supports joining as either a worker (agent) or control plane (server) node.
 # Requires root privileges (run with sudo).
 #
-# Usage: sudo ./join-cluster.sh [--driver-cache /path/to/debs]
+# Usage: sudo ./join-cluster.sh [--driver-cache /path/to/debs] [--zram|--no-zram]
 
 # Ensure the script is run as root
 if [ "$EUID" -ne 0 ]; then
@@ -17,15 +17,24 @@ fi
 
 # --- Parse CLI arguments ---
 DRIVER_CACHE=""
+ENABLE_ZRAM=""  # "", "yes", "no" — empty means prompt with RAM-based default
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --driver-cache)
             DRIVER_CACHE="$2"
             shift 2
             ;;
+        --zram)
+            ENABLE_ZRAM="yes"
+            shift
+            ;;
+        --no-zram)
+            ENABLE_ZRAM="no"
+            shift
+            ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: sudo ./join-cluster.sh [--driver-cache /path/to/debs]"
+            echo "Usage: sudo ./join-cluster.sh [--driver-cache /path/to/debs] [--zram|--no-zram]"
             exit 1
             ;;
     esac
@@ -345,10 +354,53 @@ echo ""
 # ------------------------------------------------------------------------------
 echo "--- Step 6: Configuring Server Settings ---"
 
-# --- Disable swap ---
-echo "Disabling swap..."
+# --- Disable disk swap ---
+echo "Disabling disk swap..."
 swapoff -a
 sed -i '/\sswap\s/{/^#/!s/^/#/}' /etc/fstab
+
+# --- Optional: zram swap (compressed in-RAM) ---
+# Absorbs short-lived memory spikes (e.g. browser child processes inside
+# scraper pods) by compressing cold pages with zstd instead of writing them
+# to disk. Costs CPU on each page-in/page-out; net win for low-RAM nodes.
+if [ "$TOTAL_MEM_GB" -le 8 ]; then
+    ZRAM_DEFAULT="y"
+else
+    ZRAM_DEFAULT="n"
+fi
+
+if [ "$ENABLE_ZRAM" = "yes" ]; then
+    ZRAM_CHOICE="y"
+elif [ "$ENABLE_ZRAM" = "no" ]; then
+    ZRAM_CHOICE="n"
+else
+    read -p "Enable zram swap (compressed in-RAM)? Recommended on <=8GB nodes. [y/N, default: $ZRAM_DEFAULT]: " ZRAM_CHOICE
+    ZRAM_CHOICE=${ZRAM_CHOICE:-$ZRAM_DEFAULT}
+fi
+
+ZRAM_ENABLED=false
+if [[ "$ZRAM_CHOICE" =~ ^[Yy]$ ]]; then
+    echo "Configuring zram swap (zstd, ram/2)..."
+    apt-get install -y systemd-zram-generator
+    cat > /etc/systemd/zram-generator.conf << 'ZRAMEOF'
+[zram0]
+zram-size = ram / 2
+compression-algorithm = zstd
+swap-priority = 100
+fs-type = swap
+ZRAMEOF
+    systemctl daemon-reload
+    # systemd-zram-generator wires up systemd-zram-setup@zram0.service.
+    systemctl start systemd-zram-setup@zram0.service 2>/dev/null || \
+        systemctl start dev-zram0.swap 2>/dev/null || true
+    if swapon --show=NAME --noheadings 2>/dev/null | grep -q '^/dev/zram'; then
+        echo "[SUCCESS] zram swap active."
+        ZRAM_ENABLED=true
+    else
+        echo "[WARNING] zram configured but not active yet — will start on next boot."
+        ZRAM_ENABLED=true
+    fi
+fi
 
 # --- Mask sleep/suspend targets ---
 echo "Masking sleep and suspend targets..."
@@ -363,6 +415,34 @@ for SETTING in HandleLidSwitch HandleLidSwitchDocked HandleLidSwitchExternalPowe
     fi
 done
 systemctl kill -s HUP systemd-logind
+
+# --- NetworkManager: always restart ---
+# Memory pressure or a kernel stall can starve systemd long enough for its
+# bus calls to time out; on recovery it concludes dbus-using services are
+# dead and SIGTERMs them. NM exits 0 (clean), and the default
+# Restart=on-failure does not catch a clean exit — leaving the node LAN-less
+# until manual intervention. Force a restart on any exit.
+echo "Configuring NetworkManager always-restart drop-in..."
+mkdir -p /etc/systemd/system/NetworkManager.service.d
+cat > /etc/systemd/system/NetworkManager.service.d/restart.conf << 'NMRSTEOF'
+[Service]
+Restart=always
+RestartSec=5s
+NMRSTEOF
+
+# tailscaled has the same exposure: default Restart=on-failure, but the
+# dbus-cascade SIGTERMs cause a clean exit (or leave the process alive
+# but stalled with "subscriber slow Xm elapsed" / DNS timeouts seen on
+# 2026-05-08). Force a restart on any exit, including hangs detected by
+# WatchdogSec at the unit level if/when systemd watchdog is enabled.
+echo "Configuring tailscaled always-restart drop-in..."
+mkdir -p /etc/systemd/system/tailscaled.service.d
+cat > /etc/systemd/system/tailscaled.service.d/restart.conf << 'TSRSTEOF'
+[Service]
+Restart=always
+RestartSec=5s
+TSRSTEOF
+systemctl daemon-reload
 
 # --- Battery health (for laptops) ---
 if [ -d /sys/class/power_supply/BAT0 ] || [ -d /sys/class/power_supply/BAT1 ]; then
@@ -750,12 +830,19 @@ systemctl restart cpufrequtils 2>/dev/null || cpufreq-set -g performance 2>/dev/
 
 # --- Kernel tuning ---
 echo "Configuring kernel sysctls..."
-cat > /etc/sysctl.d/99-k3s-node.conf << 'SYSCTLEOF'
+if [ "$ZRAM_ENABLED" = true ]; then
+    SWAPPINESS=180
+    SWAP_COMMENT="# zram swap active — eagerly use compressed in-RAM swap"
+else
+    SWAPPINESS=0
+    SWAP_COMMENT="# No swap — never page out"
+fi
+cat > /etc/sysctl.d/99-k3s-node.conf << SYSCTLEOF
 # OOM: use killer rather than panic, kill offender not arbitrary victim
 vm.panic_on_oom=0
 vm.oom_kill_allocating_task=1
-# No swap
-vm.swappiness=0
+${SWAP_COMMENT}
+vm.swappiness=${SWAPPINESS}
 
 # k8s workload limits — defaults too low for many-pod nodes
 fs.inotify.max_user_instances=8192
@@ -1157,11 +1244,18 @@ apt-get clean
 echo ""
 echo "--- Step 11: Verification ---"
 
-echo "Verifying swap is disabled..."
-if [ "$(swapon --show | wc -l)" -eq 0 ]; then
-    echo "[SUCCESS] Swap is disabled."
+echo "Verifying swap configuration..."
+NON_ZRAM_SWAP=$(swapon --show=NAME --noheadings 2>/dev/null | grep -v '^/dev/zram' || true)
+if [ -n "$NON_ZRAM_SWAP" ]; then
+    echo "[WARNING] Disk swap still active: $NON_ZRAM_SWAP"
+elif [ "$ZRAM_ENABLED" = true ]; then
+    if swapon --show=NAME --noheadings 2>/dev/null | grep -q '^/dev/zram'; then
+        echo "[SUCCESS] zram swap active, no disk swap."
+    else
+        echo "[INFO] zram configured (will activate on reboot), no disk swap."
+    fi
 else
-    echo "[WARNING] Swap is still active."
+    echo "[SUCCESS] Swap is disabled."
 fi
 
 echo "Verifying Tailscale is running..."
