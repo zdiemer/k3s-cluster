@@ -797,7 +797,10 @@ echo "Configuring GRUB kernel parameters..."
 GRUB_FILE="/etc/default/grub"
 GRUB_CHANGED=false
 
-GRUB_PARAMS=("consoleblank=0" "usbcore.autosuspend=-1")
+# panic=10: a panicking kernel reboots rather than sitting at the trace. These
+# nodes are headless and not all of them are somewhere convenient, so a panic
+# that waits for a human is an outage until someone walks over to it.
+GRUB_PARAMS=("consoleblank=0" "usbcore.autosuspend=-1" "panic=10")
 if [[ "${DISABLE_APST:-n}" =~ ^[Yy]$ ]]; then
     GRUB_PARAMS+=("nvme_core.default_ps_max_latency_us=0")
 fi
@@ -808,6 +811,15 @@ for PARAM in "${GRUB_PARAMS[@]}"; do
     fi
 done
 
+# The other half of surviving a bad boot, and the one that bites hardest: after
+# an unclean shutdown Ubuntu sets recordfail and then holds the boot menu open
+# *indefinitely* waiting for a keypress. On a headless node that turns a single
+# failed boot into a node that never comes back, whatever actually went wrong.
+if ! grep -q "^GRUB_RECORDFAIL_TIMEOUT=" "$GRUB_FILE"; then
+    echo 'GRUB_RECORDFAIL_TIMEOUT=5' >> "$GRUB_FILE"
+    GRUB_CHANGED=true
+fi
+
 if [ "$GRUB_CHANGED" = true ]; then
     echo "Updating GRUB..."
     update-grub
@@ -816,8 +828,27 @@ fi
 # --- Unattended upgrades ---
 echo "Installing and configuring unattended-upgrades..."
 apt-get install -y unattended-upgrades
+# Automatic-Reboot was already false, but that only defers a kernel — it does
+# not stop one being installed, and the node then boots it on the next restart
+# for any reason at all. That is how a laptop here took a 7.0 kernel it could
+# not boot, with nothing linking the eventual panic to an upgrade days earlier.
+#
+# The fleet mixes server hardware with old laptops and a kernel fine on one is
+# not necessarily fine on another, so kernel changes are made deliberately, via
+# scripts/k3s/update.sh, where they are drained and observed one node at a
+# time. Everything else still updates unattended.
 cat > /etc/apt/apt.conf.d/50unattended-upgrades-local << 'UUEOF'
 Unattended-Upgrade::Automatic-Reboot "false";
+
+Unattended-Upgrade::Package-Blacklist {
+    "linux-image-";
+    "linux-headers-";
+    "linux-generic";
+    "linux-image-generic";
+    "linux-headers-generic";
+    "linux-modules-";
+    "linux-tools-";
+};
 UUEOF
 
 # --- CPU governor ---
