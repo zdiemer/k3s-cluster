@@ -46,6 +46,58 @@ echo "==========================================================================
 echo ""
 
 # ------------------------------------------------------------------------------
+# Shared: iSCSI initiator setup (mirrored in apply-updates.sh)
+# ------------------------------------------------------------------------------
+# Called from Step 7, after open-iscsi is installed. Idempotent.
+configure_iscsi_initiator() {
+    echo "Configuring iSCSI initiator..."
+
+    # Every initiator on the network must have a unique IQN. Two nodes sharing
+    # one will fight over sessions and corrupt them — a real risk when a node is
+    # built by cloning another's disk. A node can only spot a missing name
+    # locally; cross-node duplicate detection needs a cluster view and lives in
+    # selfhosted/scripts/k3s/iscsi-prereq.sh.
+    if [ ! -s /etc/iscsi/initiatorname.iscsi ] || \
+       ! grep -q '^InitiatorName=iqn\.' /etc/iscsi/initiatorname.iscsi; then
+        echo "  Generating initiator IQN..."
+        echo "InitiatorName=$(iscsi-iname)" > /etc/iscsi/initiatorname.iscsi
+        chmod 600 /etc/iscsi/initiatorname.iscsi
+    fi
+
+    # Log back into targets automatically after a reboot, otherwise volumes only
+    # reattach when something forces a re-login.
+    sed -i 's/^node\.startup\s*=.*/node.startup = automatic/' /etc/iscsi/iscsid.conf
+    grep -q '^node\.startup' /etc/iscsi/iscsid.conf || \
+        echo 'node.startup = automatic' >> /etc/iscsi/iscsid.conf
+
+    # How long I/O stalls before errors are returned upward. The 120s default
+    # read-onlys every ext4 volume over a brief NAS blip; 300s rides out a reboot
+    # or short maintenance while still failing in a bounded time on a genuine
+    # hardware failure. Planned NAS windows should still be quiesced with
+    # selfhosted/scripts/k3s/nas-maintenance.sh rather than relying on this.
+    sed -i 's/^node\.session\.timeo\.replacement_timeout\s*=.*/node.session.timeo.replacement_timeout = 300/' \
+        /etc/iscsi/iscsid.conf
+    grep -q '^node\.session\.timeo\.replacement_timeout' /etc/iscsi/iscsid.conf || \
+        echo 'node.session.timeo.replacement_timeout = 300' >> /etc/iscsi/iscsid.conf
+
+    # Shield iscsid from the OOM killer. This is not paranoia: iscsid was
+    # oom-killed on zachd-ubuntu on 2026-08-06, and a dead iscsid takes every
+    # iSCSI volume on that node read-only — worse than losing almost any
+    # workload the killer might have picked instead. Storage infrastructure gets
+    # the same treatment as kubelet and containerd. -1000 means never.
+    mkdir -p /etc/systemd/system/iscsid.service.d
+    cat > /etc/systemd/system/iscsid.service.d/oom.conf << 'ISCSIOOMEOF'
+[Service]
+OOMScoreAdjust=-1000
+ISCSIOOMEOF
+    systemctl daemon-reload
+
+    systemctl enable --now iscsid open-iscsi 2>/dev/null || true
+
+    echo "  [OK] $(grep '^InitiatorName=' /etc/iscsi/initiatorname.iscsi)"
+}
+
+# ------------------------------------------------------------------------------
 # 0. WiFi Driver Detection & Install
 # ------------------------------------------------------------------------------
 echo "--- Step 0: WiFi Driver Detection ---"
@@ -918,16 +970,28 @@ EOF
 fi
 
 # ------------------------------------------------------------------------------
-# 7. Tools & Diagnostics
+# 7. Storage Clients, Tools & Diagnostics
 # ------------------------------------------------------------------------------
-echo "--- Step 7: Tools & Diagnostics ---"
+echo "--- Step 7: Storage Clients, Tools & Diagnostics ---"
 
-echo "Installing diagnostic tools and storage utilities..."
+# open-iscsi and nfs-common are REQUIRED, not optional. Cluster PVCs live on the
+# TrueNAS via democratic-csi: iSCSI zvols for RWO, NFS datasets for RWX. Without
+# these the node joins looking perfectly healthy and then fails to mount every
+# volume the moment a stateful pod is scheduled onto it.
+#
+# These were dropped in 9e8dc84 alongside an fstab NFS mount that only ever
+# exposed the control plane's own disk. Removing that mount was right; removing
+# the client packages was collateral. Only the packages come back — democratic-csi
+# mounts each volume itself, so there is no fstab entry to restore.
+echo "Installing storage clients, diagnostic tools and storage utilities..."
 apt-get update
 apt-get install -y \
+    open-iscsi nfs-common \
     jq btop smartmontools \
     htop iotop iftop tcpdump lsof ncdu \
     dnsutils net-tools rsync ethtool conntrack
+
+configure_iscsi_initiator
 
 # ------------------------------------------------------------------------------
 # 8. Join K3s Cluster
