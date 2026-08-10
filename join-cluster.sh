@@ -342,6 +342,18 @@ else
     echo "[SUCCESS] Token retrieved."
 fi
 
+# Join at the control plane's k3s version, not whatever upstream "stable" is
+# today — an unpinned install can put a fresh node a minor ahead of the fleet.
+# Override with INSTALL_K3S_VERSION=... for a deliberate version.
+if [ -z "${INSTALL_K3S_VERSION:-}" ]; then
+    INSTALL_K3S_VERSION=$(ssh -o StrictHostKeyChecking=accept-new "$SSH_USER@$CONTROL_PLANE_IP" "k3s --version" 2>/dev/null | head -1 | awk '{print $3}')
+fi
+if [ -z "$INSTALL_K3S_VERSION" ]; then
+    echo "Error: could not detect the control plane's k3s version."
+    read -p "Enter the k3s version to install (e.g. v1.34.6+k3s1): " INSTALL_K3S_VERSION
+fi
+echo "Joining with k3s $INSTALL_K3S_VERSION"
+
 # ------------------------------------------------------------------------------
 # 4. Resource Calculation
 # ------------------------------------------------------------------------------
@@ -1035,6 +1047,7 @@ echo "Kubelet reservations: kube=$KUBE_RESERVED, system=$SYSTEM_RESERVED"
 echo "Downloading and running the K3s installation script..."
 if [ "$NODE_ROLE" = "server" ]; then
     curl -sfL https://get.k3s.io | \
+        INSTALL_K3S_VERSION="$INSTALL_K3S_VERSION" \
         K3S_TOKEN="$K3S_TOKEN" \
         K3S_NODE_NAME="$K3S_NODE_NAME" \
         sh -s - server \
@@ -1048,6 +1061,7 @@ if [ "$NODE_ROLE" = "server" ]; then
         --protect-kernel-defaults=false
 else
     curl -sfL https://get.k3s.io | \
+        INSTALL_K3S_VERSION="$INSTALL_K3S_VERSION" \
         K3S_URL="https://$CONTROL_PLANE_IP:6443" \
         K3S_TOKEN="$K3S_TOKEN" \
         K3S_NODE_NAME="$K3S_NODE_NAME" \
