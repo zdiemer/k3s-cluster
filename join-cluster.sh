@@ -820,22 +820,78 @@ DRAINTMEOF
 #!/bin/bash
 # Warn if the battery is charging well above the configured cap. Charge control
 # is best-effort across vendors; this turns a silent no-op into a visible one.
+#
+# Config (all optional) comes from /etc/battery-cap-verify.env:
+#   NTFY_URL, NTFY_TOPIC, NTFY_TOKEN — publish warnings to ntfy. With no token
+#   the check still logs to syslog; ntfy is additive, never required.
 CAP=80
 GRACE=5
+STATE_DIR=/var/lib/battery-cap-verify
+RENOTIFY_SECS=86400   # a stuck battery is a standing condition, not hourly news
+
+[ -r /etc/battery-cap-verify.env ] && . /etc/battery-cap-verify.env
+
+mkdir -p "$STATE_DIR"
+
+notify() {
+    local title="$1" body="$2"
+    [ -n "$NTFY_TOKEN" ] && [ -n "$NTFY_TOPIC" ] || return 0
+    curl -fsS --max-time 10 \
+        -H "Authorization: Bearer $NTFY_TOKEN" \
+        -H "Title: $title" \
+        -H "Priority: high" \
+        -H "Tags: battery,warning" \
+        -d "$body" \
+        "${NTFY_URL:-https://ntfy.zachd.duckdns.org}/${NTFY_TOPIC}" >/dev/null 2>&1 \
+        || logger -t battery-cap-verify -p daemon.warning "ntfy publish failed"
+}
+
 for bat in /sys/class/power_supply/BAT*; do
     [ -f "$bat/capacity" ] || continue
     cap=$(cat "$bat/capacity" 2>/dev/null)
     status=$(cat "$bat/status" 2>/dev/null)
     name=$(basename "$bat")
     [ -n "$cap" ] || continue
+
+    stamp="$STATE_DIR/$name.notified"
+
     if [ "$cap" -gt "$((CAP + GRACE))" ] && [ "$status" != "Discharging" ]; then
-        logger -t battery-cap-verify -p daemon.warning \
-            "$name at ${cap}% (status=$status) exceeds cap ${CAP}% — charge control not honoured by firmware"
+        msg="$name at ${cap}% (status=$status) exceeds cap ${CAP}% — charge control not honoured by firmware"
+        logger -t battery-cap-verify -p daemon.warning "$msg"
+
+        now=$(date +%s)
+        last=0
+        [ -r "$stamp" ] && last=$(cat "$stamp" 2>/dev/null || echo 0)
+        if [ "$((now - last))" -ge "$RENOTIFY_SECS" ]; then
+            notify "Battery cap not holding on $(hostname)" \
+                   "$(hostname): $msg"
+            echo "$now" > "$stamp"
+        fi
+    else
+        # Back in band — clear the throttle so a recurrence notifies promptly.
+        rm -f "$stamp"
     fi
 done
 exit 0
 VERIFYEOF
         chmod +x /usr/local/bin/battery-cap-verify
+
+        # Publish target for the watchdog. NTFY_TOKEN is picked up from the
+        # environment at join time if present; otherwise the file is written
+        # with an empty token and the check degrades to syslog-only until it
+        # is filled in.
+        if [ ! -f /etc/battery-cap-verify.env ]; then
+            cat > /etc/battery-cap-verify.env << ENVEOF
+NTFY_URL=${NTFY_URL:-https://ntfy.zachd.duckdns.org}
+NTFY_TOPIC=${NTFY_TOPIC:-homelab-battery}
+NTFY_TOKEN=${NTFY_TOKEN:-}
+ENVEOF
+            chmod 600 /etc/battery-cap-verify.env
+            if [ -z "${NTFY_TOKEN:-}" ]; then
+                echo "[INFO] /etc/battery-cap-verify.env written with an empty NTFY_TOKEN."
+                echo "[INFO] Warnings go to syslog only until a token is added."
+            fi
+        fi
 
         cat > /etc/systemd/system/battery-cap-verify.service << 'VSVCEOF'
 [Unit]
@@ -843,6 +899,7 @@ Description=Verify battery charge cap is honoured by firmware
 
 [Service]
 Type=oneshot
+EnvironmentFile=-/etc/battery-cap-verify.env
 ExecStart=/usr/local/bin/battery-cap-verify
 VSVCEOF
 
