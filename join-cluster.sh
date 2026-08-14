@@ -557,11 +557,15 @@ if [ -d /sys/class/power_supply/BAT0 ] || [ -d /sys/class/power_supply/BAT1 ]; t
             [ -d "$BAT_PATH" ] || continue
             START_FILE="$BAT_PATH/charge_control_start_threshold"
             END_FILE="$BAT_PATH/charge_control_end_threshold"
-            if [ -f "$END_FILE" ] && [ -f "$START_FILE" ]; then
-                echo 80 > "$END_FILE" 2>/dev/null && \
-                echo 75 > "$START_FILE" 2>/dev/null && \
-                CHARGE_CONFIGURED=true && \
-                echo "[SUCCESS] Set charge thresholds on $(basename "$BAT_PATH"): 75-80%"
+            # Only the end threshold is required: plenty of ECs (the Grunt/Galtic
+            # Chromebooks, for one) expose end but no start. Requiring both meant
+            # those machines fell through and charged to 100% forever.
+            if [ -f "$END_FILE" ]; then
+                if echo 80 > "$END_FILE" 2>/dev/null; then
+                    [ -f "$START_FILE" ] && echo 75 > "$START_FILE" 2>/dev/null
+                    CHARGE_CONFIGURED=true
+                    echo "[SUCCESS] Set charge thresholds on $(basename "$BAT_PATH"): 75-80%"
+                fi
             fi
         done
         if [ "$CHARGE_CONFIGURED" = true ]; then
@@ -577,8 +581,9 @@ ExecStart=/bin/bash -c '\
   for bat in /sys/class/power_supply/BAT*; do \
     [ -f "$bat/charge_control_end_threshold" ] || continue; \
     echo 80 > "$bat/charge_control_end_threshold" 2>/dev/null; \
-    echo 75 > "$bat/charge_control_start_threshold" 2>/dev/null; \
-  done'
+    [ -f "$bat/charge_control_start_threshold" ] && \
+      echo 75 > "$bat/charge_control_start_threshold" 2>/dev/null; \
+  done; exit 0'
 
 [Install]
 WantedBy=multi-user.target
@@ -802,6 +807,71 @@ DRAINTMEOF
 
     if [ "$CHARGE_CONFIGURED" = false ]; then
         echo "[INFO] No charge control support — thresholds depend on TLP or BIOS."
+    fi
+
+    # --- Verify the cap is actually honoured ---
+    # CHARGE_CONFIGURED only means "the write succeeded", not "the firmware
+    # obeyed it". On some hardware (notably the XPS 13 9350) the sysfs threshold
+    # files accept writes and the EC ignores them, so the node reports success at
+    # join time and then sits pinned at 100% indefinitely. Record the intent and
+    # let a timer confirm the battery actually settles into the band.
+    if [ "$CHARGE_CONFIGURED" = true ]; then
+        cat > /usr/local/bin/battery-cap-verify << 'VERIFYEOF'
+#!/bin/bash
+# Warn if the battery is charging well above the configured cap. Charge control
+# is best-effort across vendors; this turns a silent no-op into a visible one.
+CAP=80
+GRACE=5
+for bat in /sys/class/power_supply/BAT*; do
+    [ -f "$bat/capacity" ] || continue
+    cap=$(cat "$bat/capacity" 2>/dev/null)
+    status=$(cat "$bat/status" 2>/dev/null)
+    name=$(basename "$bat")
+    [ -n "$cap" ] || continue
+    if [ "$cap" -gt "$((CAP + GRACE))" ] && [ "$status" != "Discharging" ]; then
+        logger -t battery-cap-verify -p daemon.warning \
+            "$name at ${cap}% (status=$status) exceeds cap ${CAP}% — charge control not honoured by firmware"
+    fi
+done
+exit 0
+VERIFYEOF
+        chmod +x /usr/local/bin/battery-cap-verify
+
+        cat > /etc/systemd/system/battery-cap-verify.service << 'VSVCEOF'
+[Unit]
+Description=Verify battery charge cap is honoured by firmware
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/battery-cap-verify
+VSVCEOF
+
+        cat > /etc/systemd/system/battery-cap-verify.timer << 'VTMEOF'
+[Unit]
+Description=Check hourly that the battery charge cap is holding
+
+[Timer]
+OnBootSec=30min
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+VTMEOF
+        systemctl enable --now battery-cap-verify.timer
+        echo "Installed battery-cap-verify.timer (hourly cap check)."
+
+        # Immediate feedback at join time, before the timer's first run.
+        sleep 5
+        for BAT_PATH in /sys/class/power_supply/BAT*; do
+            [ -f "$BAT_PATH/capacity" ] || continue
+            NOW=$(cat "$BAT_PATH/capacity" 2>/dev/null)
+            ST=$(cat "$BAT_PATH/status" 2>/dev/null)
+            if [ -n "$NOW" ] && [ "$NOW" -gt 85 ] && [ "$ST" != "Discharging" ]; then
+                echo "[WARNING] $(basename "$BAT_PATH") is at ${NOW}% (${ST}) despite a configured 75-80% cap."
+                echo "[WARNING] The firmware is likely ignoring it. Verify before trusting the cap on this model."
+            fi
+        done
     fi
 
     # --- Thermal management (Intel) ---
