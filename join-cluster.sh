@@ -513,6 +513,42 @@ if [ -d /sys/class/power_supply/BAT0 ] || [ -d /sys/class/power_supply/BAT1 ]; t
     echo "Laptop detected. Configuring battery health settings..."
     apt-get install -y tlp
 
+    # Shared ntfy publisher for both battery watchdogs. Sourced, never executed.
+    # Token belongs to ntfy's write-only `alerts` user:
+    #   NTFY_TOKEN=$(op read "op://homelab/ntfy-battery-watchdog/credential")
+    # Revoke with: ntfy token remove alerts <token>  (in the ntfy pod).
+    mkdir -p /usr/local/lib
+    cat > /usr/local/lib/battery-notify.sh << 'NOTIFYEOF'
+# shellcheck shell=bash
+[ -r /etc/battery-notify.env ] && . /etc/battery-notify.env
+
+battery_notify() {
+    local title="$1" body="$2" priority="${3:-high}"
+    [ -n "$NTFY_TOKEN" ] && [ -n "$NTFY_TOPIC" ] || return 0
+    curl -fsS --max-time 10 \
+        -H "Authorization: Bearer $NTFY_TOKEN" \
+        -H "Title: $title" \
+        -H "Priority: $priority" \
+        -H "Tags: battery,warning" \
+        -d "$body" \
+        "${NTFY_URL:-https://ntfy.zachd.duckdns.org}/${NTFY_TOPIC}" >/dev/null 2>&1 \
+        || logger -t battery-notify -p daemon.warning "ntfy publish failed"
+}
+NOTIFYEOF
+
+    if [ ! -f /etc/battery-notify.env ]; then
+        cat > /etc/battery-notify.env << ENVEOF
+NTFY_URL=${NTFY_URL:-https://ntfy.zachd.duckdns.org}
+NTFY_TOPIC=${NTFY_TOPIC:-homelab-battery}
+NTFY_TOKEN=${NTFY_TOKEN:-}
+ENVEOF
+        chmod 600 /etc/battery-notify.env
+        if [ -z "${NTFY_TOKEN:-}" ]; then
+            echo "[INFO] /etc/battery-notify.env written with an empty NTFY_TOKEN."
+            echo "[INFO] Battery warnings go to syslog only until a token is added."
+        fi
+    fi
+
     # Set TLP charge thresholds in config (for hardware TLP natively supports)
     if [ -f /etc/tlp.conf ]; then
         for VAR in START_CHARGE_THRESH_BAT0=75 STOP_CHARGE_THRESH_BAT0=80 \
@@ -821,30 +857,16 @@ DRAINTMEOF
 # Warn if the battery is charging well above the configured cap. Charge control
 # is best-effort across vendors; this turns a silent no-op into a visible one.
 #
-# Config (all optional) comes from /etc/battery-cap-verify.env:
-#   NTFY_URL, NTFY_TOPIC, NTFY_TOKEN — publish warnings to ntfy. With no token
-#   the check still logs to syslog; ntfy is additive, never required.
+# ntfy config comes from /etc/battery-notify.env via the shared helper. With no
+# token the check still logs to syslog; ntfy is additive, never required.
 CAP=80
 GRACE=5
 STATE_DIR=/var/lib/battery-cap-verify
 RENOTIFY_SECS=86400   # a stuck battery is a standing condition, not hourly news
 
-[ -r /etc/battery-cap-verify.env ] && . /etc/battery-cap-verify.env
+. /usr/local/lib/battery-notify.sh
 
 mkdir -p "$STATE_DIR"
-
-notify() {
-    local title="$1" body="$2"
-    [ -n "$NTFY_TOKEN" ] && [ -n "$NTFY_TOPIC" ] || return 0
-    curl -fsS --max-time 10 \
-        -H "Authorization: Bearer $NTFY_TOKEN" \
-        -H "Title: $title" \
-        -H "Priority: high" \
-        -H "Tags: battery,warning" \
-        -d "$body" \
-        "${NTFY_URL:-https://ntfy.zachd.duckdns.org}/${NTFY_TOPIC}" >/dev/null 2>&1 \
-        || logger -t battery-cap-verify -p daemon.warning "ntfy publish failed"
-}
 
 for bat in /sys/class/power_supply/BAT*; do
     [ -f "$bat/capacity" ] || continue
@@ -863,8 +885,8 @@ for bat in /sys/class/power_supply/BAT*; do
         last=0
         [ -r "$stamp" ] && last=$(cat "$stamp" 2>/dev/null || echo 0)
         if [ "$((now - last))" -ge "$RENOTIFY_SECS" ]; then
-            notify "Battery cap not holding on $(hostname)" \
-                   "$(hostname): $msg"
+            battery_notify "Battery cap not holding on $(hostname)" \
+                           "$(hostname): $msg"
             echo "$now" > "$stamp"
         fi
     else
@@ -876,33 +898,13 @@ exit 0
 VERIFYEOF
         chmod +x /usr/local/bin/battery-cap-verify
 
-        # Publish target for the watchdog. NTFY_TOKEN is picked up from the
-        # environment at join time if present; otherwise the file is written
-        # with an empty token and the check degrades to syslog-only until it
-        # is filled in. The token belongs to ntfy's write-only `alerts` user
-        # and lives in 1Password:
-        #   NTFY_TOKEN=$(op read "op://homelab/ntfy-battery-watchdog/credential")
-        # Revoke with: ntfy token remove alerts <token>  (in the ntfy pod).
-        if [ ! -f /etc/battery-cap-verify.env ]; then
-            cat > /etc/battery-cap-verify.env << ENVEOF
-NTFY_URL=${NTFY_URL:-https://ntfy.zachd.duckdns.org}
-NTFY_TOPIC=${NTFY_TOPIC:-homelab-battery}
-NTFY_TOKEN=${NTFY_TOKEN:-}
-ENVEOF
-            chmod 600 /etc/battery-cap-verify.env
-            if [ -z "${NTFY_TOKEN:-}" ]; then
-                echo "[INFO] /etc/battery-cap-verify.env written with an empty NTFY_TOKEN."
-                echo "[INFO] Warnings go to syslog only until a token is added."
-            fi
-        fi
-
         cat > /etc/systemd/system/battery-cap-verify.service << 'VSVCEOF'
 [Unit]
 Description=Verify battery charge cap is honoured by firmware
 
 [Service]
 Type=oneshot
-EnvironmentFile=-/etc/battery-cap-verify.env
+EnvironmentFile=-/etc/battery-notify.env
 ExecStart=/usr/local/bin/battery-cap-verify
 VSVCEOF
 
@@ -1289,26 +1291,110 @@ echo "Tailscale watchdog installed."
 # On Macs and some other laptops, software charge limiting isn't possible from
 # Linux. This watchdog monitors battery temperature to catch swelling or thermal
 # runaway — the actual fire hazard — and shuts down safely before it's dangerous.
-if [ -f /sys/class/power_supply/BAT0/temp ] || [ -f /sys/class/power_supply/BAT1/temp ]; then
+#
+# Gated on being a laptop at all, NOT on BAT*/temp existing. The old gate meant
+# any machine without a battery thermistor got no watchdog and no warning that
+# it had none — and worse, several nodes ended up with the timer installed and
+# firing every 2 minutes against a sensor that did not exist, silently doing
+# nothing for months. The script itself now decides which sensor tier to use.
+if [ -d /sys/class/power_supply/BAT0 ] || [ -d /sys/class/power_supply/BAT1 ]; then
     cat > /usr/local/bin/battery-watchdog << 'BATWDEOF'
 #!/bin/bash
-WARN_TEMP=450   # 45.0°C — elevated, log warning
-CRIT_TEMP=550   # 55.0°C — dangerous, shut down
+# Two tiers, because a real battery thermistor is rare on this fleet:
+#
+#   Tier 1 — /sys/class/power_supply/BAT*/temp. An actual battery sensor, so a
+#            reading here is authoritative: warn at 45C, shut down at 55C.
+#
+#   Tier 2 — the nearest sensor physically adjacent to the battery bay
+#            (dell_smm "Ambient", cros_ec "Charger"/"Ambient"). These track the
+#            battery loosely and sit 10-20C above it under load, so they WARN
+#            ONLY and never shut down. Do not add CPU/package/coretemp zones
+#            here: those idle at 55-75C on this hardware and would trigger an
+#            immediate shutdown loop if treated as battery temperature.
+WARN_TEMP=450    # 45.0C on a true battery sensor
+CRIT_TEMP=550    # 55.0C on a true battery sensor — shut down
+PROXY_WARN=600   # 60.0C on a proxy sensor — warn only, never shut down
+STATE_DIR=/var/lib/battery-watchdog
+RENOTIFY_SECS=3600
 
+. /usr/local/lib/battery-notify.sh
+mkdir -p "$STATE_DIR"
+
+# Throttle: the timer runs every 2 min; a hot battery is a standing condition.
+throttled() {
+    local key="$1" stamp="$STATE_DIR/$1.notified" now last=0
+    now=$(date +%s)
+    [ -r "$stamp" ] && last=$(cat "$stamp" 2>/dev/null || echo 0)
+    if [ "$((now - last))" -ge "$RENOTIFY_SECS" ]; then
+        echo "$now" > "$stamp"
+        return 1
+    fi
+    return 0
+}
+
+c() { awk "BEGIN{printf \"%.1f\", $1/10}"; }
+
+found_sensor=0
+
+# --- Tier 1: true battery sensors ---
 for bat in /sys/class/power_supply/BAT*; do
     [ -f "$bat/temp" ] || continue
     temp=$(cat "$bat/temp" 2>/dev/null) || continue
+    [ -n "$temp" ] || continue
     name=$(basename "$bat")
+    found_sensor=1
 
     if [ "$temp" -ge "$CRIT_TEMP" ] 2>/dev/null; then
         logger -t battery-watchdog -p daemon.crit \
-            "CRITICAL: $name temperature ${temp} ($(awk "BEGIN{printf \"%.1f\", $temp/10}")°C) — initiating shutdown"
+            "CRITICAL: $name temperature ${temp} ($(c "$temp")C) — initiating shutdown"
+        battery_notify "BATTERY CRITICAL on $(hostname)" \
+            "$(hostname): $name at $(c "$temp")C — exceeded ${CRIT_TEMP} limit, shutting down now." urgent
+        sleep 2   # give the publish a chance to leave the box
         shutdown now "Battery temperature critical"
     elif [ "$temp" -ge "$WARN_TEMP" ] 2>/dev/null; then
         logger -t battery-watchdog -p daemon.warning \
-            "WARNING: $name temperature ${temp} ($(awk "BEGIN{printf \"%.1f\", $temp/10}")°C)"
+            "WARNING: $name temperature ${temp} ($(c "$temp")C)"
+        throttled "$name" || battery_notify "Battery warm on $(hostname)" \
+            "$(hostname): $name at $(c "$temp")C (warn threshold $(c "$WARN_TEMP")C)."
     fi
 done
+
+# --- Tier 2: proxy sensors near the battery bay ---
+if [ "$found_sensor" -eq 0 ]; then
+    for h in /sys/class/hwmon/hwmon*; do
+        chip=$(cat "$h/name" 2>/dev/null)
+        case "$chip" in
+            dell_smm|cros_ec) ;;
+            *) continue ;;
+        esac
+        for lf in "$h"/temp*_label; do
+            [ -f "$lf" ] || continue
+            label=$(cat "$lf" 2>/dev/null)
+            case "$label" in
+                Ambient|Charger) ;;
+                *) continue ;;
+            esac
+            input="${lf%_label}_input"
+            [ -f "$input" ] || continue
+            raw=$(cat "$input" 2>/dev/null) || continue
+            [ -n "$raw" ] || continue
+            temp=$((raw / 100))        # millidegrees -> decidegrees
+            found_sensor=1
+            if [ "$temp" -ge "$PROXY_WARN" ] 2>/dev/null; then
+                logger -t battery-watchdog -p daemon.warning \
+                    "WARNING: proxy sensor $chip/$label at $(c "$temp")C (no true battery sensor on this machine)"
+                throttled "$chip-$label" || battery_notify "Battery-area temp high on $(hostname)" \
+                    "$(hostname): $chip/$label at $(c "$temp")C. Proxy sensor — no shutdown will occur. Check the machine."
+            fi
+        done
+    done
+fi
+
+if [ "$found_sensor" -eq 0 ]; then
+    logger -t battery-watchdog -p daemon.warning \
+        "no battery or proxy temperature sensor found — this machine has NO thermal protection"
+fi
+exit 0
 BATWDEOF
     chmod +x /usr/local/bin/battery-watchdog
 
@@ -1319,6 +1405,7 @@ After=multi-user.target
 
 [Service]
 Type=oneshot
+EnvironmentFile=-/etc/battery-notify.env
 ExecStart=/usr/local/bin/battery-watchdog
 BATWDSVCEOF
 
@@ -1336,6 +1423,31 @@ BATWDTIMEOF
 
     systemctl enable --now battery-watchdog.timer
     echo "Battery temperature watchdog installed."
+
+    # Report which tier this machine actually got, so an inert watchdog is
+    # visible at join rather than discovered months later.
+    if ls /sys/class/power_supply/BAT*/temp >/dev/null 2>&1; then
+        echo "[SUCCESS] True battery sensor present — warn 45C, shutdown 55C active."
+    else
+        WD_PROXY=""
+        for h in /sys/class/hwmon/hwmon*; do
+            chip=$(cat "$h/name" 2>/dev/null)
+            case "$chip" in dell_smm|cros_ec) ;; *) continue ;; esac
+            for lf in "$h"/temp*_label; do
+                [ -f "$lf" ] || continue
+                case "$(cat "$lf" 2>/dev/null)" in
+                    Ambient|Charger) WD_PROXY="$chip/$(cat "$lf" 2>/dev/null)"; break 2 ;;
+                esac
+            done
+        done
+        if [ -n "$WD_PROXY" ]; then
+            echo "[WARNING] No true battery sensor. Falling back to proxy $WD_PROXY."
+            echo "[WARNING] Warn-only at 60C — this machine will NOT auto-shutdown on a hot battery."
+        else
+            echo "[WARNING] No battery or proxy temperature sensor found."
+            echo "[WARNING] This machine has NO battery thermal protection at all."
+        fi
+    fi
 fi
 
 # ------------------------------------------------------------------------------
