@@ -879,7 +879,10 @@ VERIFYEOF
         # Publish target for the watchdog. NTFY_TOKEN is picked up from the
         # environment at join time if present; otherwise the file is written
         # with an empty token and the check degrades to syslog-only until it
-        # is filled in.
+        # is filled in. The token belongs to ntfy's write-only `alerts` user
+        # and lives in 1Password:
+        #   NTFY_TOKEN=$(op read "op://homelab/ntfy-battery-watchdog/credential")
+        # Revoke with: ntfy token remove alerts <token>  (in the ntfy pod).
         if [ ! -f /etc/battery-cap-verify.env ]; then
             cat > /etc/battery-cap-verify.env << ENVEOF
 NTFY_URL=${NTFY_URL:-https://ntfy.zachd.duckdns.org}
