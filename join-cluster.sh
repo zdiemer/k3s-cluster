@@ -354,6 +354,48 @@ if [ -z "$INSTALL_K3S_VERSION" ]; then
 fi
 echo "Joining with k3s $INSTALL_K3S_VERSION"
 
+# The API server's serving cert only carries the SANs k3s knows about: each
+# server's LAN address, plus any explicit --tls-san. A node's Tailscale IP is
+# not in there unless someone added it, so joining via the tailnet address dies
+# with "certificate is valid for ... not <ip>" even though the tunnel is fine.
+# Step 2 picks the control plane out of `tailscale status`, so the address it
+# hands us is exactly the one most likely to be missing. Pick an address the
+# cert vouches for instead, preferring the LAN IP — which is what every server
+# in this cluster was actually joined with.
+echo "Resolving a join address covered by the API server certificate..."
+CERT_IPS=$(echo | openssl s_client -connect "$CONTROL_PLANE_IP:6443" 2>/dev/null \
+    | openssl x509 -noout -ext subjectAltName 2>/dev/null \
+    | tr ',' '\n' | sed -n 's/.*IP Address:\([0-9.]*\)$/\1/p' | tr -d ' ')
+
+JOIN_IP=""
+if [ -z "$CERT_IPS" ]; then
+    echo "[WARNING] Could not read the API server certificate — falling back to $CONTROL_PLANE_IP."
+    JOIN_IP="$CONTROL_PLANE_IP"
+else
+    # Control plane's own addresses, LAN first, tailnet address last as fallback.
+    CP_ADDRS=$( { ssh -o StrictHostKeyChecking=accept-new "$SSH_USER@$CONTROL_PLANE_IP" \
+            "ip -4 -o addr show scope global | grep -v ' tailscale0 ' | awk '{print \$4}' | cut -d/ -f1" 2>/dev/null; \
+        echo "$CONTROL_PLANE_IP"; } )
+    for addr in $CP_ADDRS; do
+        if echo "$CERT_IPS" | grep -qx "$addr"; then
+            JOIN_IP="$addr"
+            break
+        fi
+    done
+fi
+
+if [ -z "$JOIN_IP" ]; then
+    echo "Error: none of the control plane's addresses appear in its API server cert."
+    echo "  Cert covers: $(echo "$CERT_IPS" | tr '\n' ' ')"
+    echo "  Add a --tls-san for the address you want to join through, or join via a covered one."
+    exit 1
+fi
+
+if [ "$JOIN_IP" != "$CONTROL_PLANE_IP" ]; then
+    echo "Tailnet address $CONTROL_PLANE_IP is not in the cert — joining via $JOIN_IP instead."
+fi
+echo "Join address: $JOIN_IP"
+
 # ------------------------------------------------------------------------------
 # 4. Resource Calculation
 # ------------------------------------------------------------------------------
@@ -1176,6 +1218,38 @@ else
 fi
 echo "Kubelet reservations: kube=$KUBE_RESERVED, system=$SYSTEM_RESERVED"
 
+# k3s refuses to admit a server whose "critical" configuration differs from the
+# rest of the cluster — secrets-encryption, the disable-* flags, the CIDRs, the
+# flannel backend. The error is opaque ("critical configuration value mismatch
+# between servers") and it surfaces *after* the installer has already written
+# the unit file, so the node looks installed but crashloops. Copy the cluster's
+# values across before installing rather than discovering the mismatch after.
+if [ "$NODE_ROLE" = "server" ]; then
+    echo "Replicating critical k3s config from the control plane..."
+    CRITICAL_KEYS='cluster-domain|cluster-dns|cluster-cidr|service-cidr|disable-cni|disable-kube-proxy|disable-network-policy|disable-servicelb|disable-helm-controller|egress-selector-mode|secrets-encryption|flannel-backend|flannel-ipv6-masq|embedded-registry|supervisor-metrics'
+    CP_CONFIG=$(echo "$REMOTE_SUDO_PW" | ssh -o StrictHostKeyChecking=accept-new \
+        "$SSH_USER@$CONTROL_PLANE_IP" \
+        "sudo -S cat /etc/rancher/k3s/config.yaml /etc/rancher/k3s/config.yaml.d/*.yaml 2>/dev/null" 2>/dev/null \
+        | grep -E "^[[:space:]]*($CRITICAL_KEYS):" || true)
+
+    mkdir -p /etc/rancher/k3s
+    touch /etc/rancher/k3s/config.yaml
+    if [ -n "$CP_CONFIG" ]; then
+        while IFS= read -r cfgline; do
+            [ -n "$cfgline" ] || continue
+            cfgkey=$(echo "${cfgline%%:*}" | xargs)
+            if grep -qE "^[[:space:]]*$cfgkey:" /etc/rancher/k3s/config.yaml; then
+                echo "  = $cfgkey (already set locally)"
+            else
+                echo "$cfgline" >> /etc/rancher/k3s/config.yaml
+                echo "  + $cfgline"
+            fi
+        done <<< "$CP_CONFIG"
+    else
+        echo "  (control plane sets no critical config values)"
+    fi
+fi
+
 echo "Downloading and running the K3s installation script..."
 if [ "$NODE_ROLE" = "server" ]; then
     curl -sfL https://get.k3s.io | \
@@ -1183,7 +1257,7 @@ if [ "$NODE_ROLE" = "server" ]; then
         K3S_TOKEN="$K3S_TOKEN" \
         K3S_NODE_NAME="$K3S_NODE_NAME" \
         sh -s - server \
-        --server "https://$CONTROL_PLANE_IP:6443" \
+        --server "https://$JOIN_IP:6443" \
         --kubelet-arg=max-pods="$MAX_PODS" \
         --kubelet-arg=eviction-hard="memory.available<512Mi,nodefs.available<1Gi" \
         --kubelet-arg=eviction-soft="memory.available<768Mi,nodefs.available<2Gi" \
@@ -1194,7 +1268,7 @@ if [ "$NODE_ROLE" = "server" ]; then
 else
     curl -sfL https://get.k3s.io | \
         INSTALL_K3S_VERSION="$INSTALL_K3S_VERSION" \
-        K3S_URL="https://$CONTROL_PLANE_IP:6443" \
+        K3S_URL="https://$JOIN_IP:6443" \
         K3S_TOKEN="$K3S_TOKEN" \
         K3S_NODE_NAME="$K3S_NODE_NAME" \
         sh -s - \
