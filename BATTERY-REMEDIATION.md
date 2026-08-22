@@ -36,7 +36,7 @@ export NTFY_TOKEN=$(op read "op://homelab/ntfy-battery-watchdog/credential")
 
 ---
 
-## 1. Deploy the battery tooling to all six laptops
+## 1. Deploy the battery tooling to the four laptops that still have one
 
 `apply-battery.sh` replays the battery blocks from `join-cluster.sh` onto an
 already-joined node. Idempotent; `--check` reports without changing anything.
@@ -44,8 +44,8 @@ already-joined node. Idempotent; `--check` reports without changing anything.
 ```bash
 cd ~/code/k3s-cluster
 
-for n in zachd-ubuntu-laptop zachd-ubuntu-laptop-1 zachd-ubuntu-laptop-2 \
-         zachd-ubuntu-laptop-4 zachd-ubuntu-laptop-5 zachd-ubuntu-laptop-6; do
+for n in zachd-ubuntu-laptop zachd-ubuntu-laptop-4 \
+         zachd-ubuntu-laptop-5 zachd-ubuntu-laptop-6; do
   echo "=== $n"
   tailscale ssh root@$n "NTFY_TOKEN='$NTFY_TOKEN' bash -s" < apply-battery.sh
 done
@@ -54,7 +54,7 @@ done
 Dry run first if you'd rather look before touching anything:
 
 ```bash
-tailscale ssh root@zachd-ubuntu-laptop-2 "bash -s -- --check" < apply-battery.sh
+tailscale ssh root@zachd-ubuntu-laptop-6 "bash -s -- --check" < apply-battery.sh
 ```
 
 This installs, on each node: `/usr/local/lib/battery-notify.sh`,
@@ -64,21 +64,29 @@ the Dell SMBIOS path where that's the right one.
 
 ---
 
-## 2. The two Dells whose charge cap never worked
+## 2. The Dell whose charge cap never worked
 
-`zachd-ubuntu-laptop` (XPS 13 9350) and `zachd-ubuntu-laptop-2` (Latitude E7250)
-report sysfs thresholds of 75-80 while sitting at 100% and 91%. The firmware
-accepts the write and ignores it — `join-cluster.sh` even documents this. Step 1
-handles it via `smbios-battery-ctl`, but verify it actually took:
+`zachd-ubuntu-laptop` (XPS 13 9350) reports a sysfs threshold of 75-80 while
+sitting at 100%. The firmware accepts the write and ignores it —
+`join-cluster.sh` even documents this. Step 1 handles it via
+`smbios-battery-ctl`, but verify it actually took:
 
 ```bash
-tailscale ssh root@zachd-ubuntu-laptop  'smbios-battery-ctl --get-charging-cfg'
-tailscale ssh root@zachd-ubuntu-laptop-2 'smbios-battery-ctl --get-charging-cfg'
+tailscale ssh root@zachd-ubuntu-laptop 'smbios-battery-ctl --get-charging-cfg'
 # expect: custom, 75-80
 ```
 
-The XPS is the priority: worst battery in the fleet at **63% of design**, pinned
-at 100% for its entire 112-day uptime, and one of three etcd voters.
+`zachd-ubuntu-laptop-2` (Latitude E7250) had the same fault and is no longer a
+concern: its battery was physically removed on 2026-08-21, and the then-pointless
+`battery-watchdog.timer` and `battery-threshold.service` were disabled on it the
+same day. Leave it out of every loop in this document — a watchdog firing every
+two minutes against a sensor that does not exist is the exact trap the tier
+comments in `battery-watchdog` warn about.
+
+The XPS is now the only unresolved cap in the fleet, and still the worst battery
+in it at **63% of design**, pinned at 100%. It is no longer an etcd voter — it
+was demoted to agent on 2026-08-21 — so the exposure is the cell itself rather
+than the cluster role.
 
 If SMBIOS still refuses, the fallback is the BIOS setup screen (Dell calls it
 Primary/Custom charge mode), which needs physical access.
@@ -136,7 +144,10 @@ rescheduled cleanly, and it's the slowest machine in the fleet
 kubectl delete node zachd-ubuntu-laptop-3   # clears the stuck Terminating pods
 ```
 
-Then drop it from `selfhosted/infra/duckdns/values.yaml:101`.
+Then drop it from the `candidates:` list in
+`selfhosted/infra/duckdns/values.yaml` — already done for laptop-3, and done for
+laptop-1 on 2026-08-21 when it was retired. A candidate that no longer exists is
+a public ingress outage waiting for the picker to fall through to it.
 
 ---
 
@@ -149,8 +160,8 @@ SSH_USER=root ~/code/selfhosted/scripts/k3s/debug.sh --all
 Per-node spot check:
 
 ```bash
-for n in zachd-ubuntu-laptop zachd-ubuntu-laptop-1 zachd-ubuntu-laptop-2 \
-         zachd-ubuntu-laptop-4 zachd-ubuntu-laptop-5 zachd-ubuntu-laptop-6; do
+for n in zachd-ubuntu-laptop zachd-ubuntu-laptop-4 \
+         zachd-ubuntu-laptop-5 zachd-ubuntu-laptop-6; do
   echo "=== $n"
   tailscale ssh root@$n 'systemctl is-enabled battery-watchdog.timer battery-cap-verify.timer; \
      journalctl -t battery-watchdog -t battery-cap-verify -n 3 --no-pager'
@@ -166,7 +177,7 @@ tailscale ssh root@zachd-ubuntu-laptop-6 \
 
 ---
 
-## Fleet state as of 2026-08-14
+## Fleet state as of 2026-08-21
 
 Battery health is percent of design capacity. "Cap holding" is whether the
 75-80% charge limit is actually in effect, not merely configured.
@@ -174,18 +185,22 @@ Battery health is percent of design capacity. "Cap holding" is whether the
 | Node | Machine | Health | Cap holding | Temp tier |
 |---|---|---|---|---|
 | `zachd-ubuntu-laptop` | XPS 13 9350 | **63%** | **NO** — 100%, firmware ignores sysfs | proxy (`dell_smm/Ambient`) |
-| `zachd-ubuntu-laptop-1` | MacBookAir6,2 2013 | 86% | yes — BCLM + drain timer, 69% | **true sensor** |
-| `zachd-ubuntu-laptop-2` | Latitude E7250 | unknown (firmware misreports) | suspect — 91% | proxy (`dell_smm/Ambient`) |
+| `zachd-ubuntu-laptop-2` | Latitude E7250 | n/a — **battery removed 2026-08-21** | n/a, units disabled | n/a |
 | `zachd-ubuntu-laptop-3` | MacBookPro8,1 2011 | unknown — **dead** | unknown | true sensor (presumed) |
 | `zachd-ubuntu-laptop-4` | Grunt Chromebook | 98% | unproven — set to 80 on 2026-08-14 | proxy (`cros_ec/Charger`) |
 | `zachd-ubuntu-laptop-5` | Galtic Chromebook | 96% | yes — 76% | proxy (`cros_ec/Charger`) |
 | `zachd-ubuntu-laptop-6` | Latitude 3190 | 71% | yes — 78% | proxy (`dell_smm/Ambient`) |
 
-`zachd-ubuntu`, `zachd-ubuntu-1`, and `zachd-ubuntu-2` have no battery.
+`zachd-ubuntu`, `zachd-ubuntu-1`, `zachd-ubuntu-2` and the two Minisforum nodes
+(`zachd-ubuntu-4`, `zachd-ubuntu-5`) have no battery. `zachd-ubuntu-laptop-1`
+(MacBookAir6,2) was retired from the cluster entirely on 2026-08-21 and is gone
+from this table.
 
-Only laptop-1 has a true battery thermistor, so it is the only machine that will
-auto-shut-down on a hot cell. Everything else is warn-only by design — see the
-tier comments in `battery-watchdog`.
+**No machine still in the fleet has a true battery thermistor.** laptop-1 was one
+of only two that did and it is retired; the other, laptop-3, is dead. Every
+remaining node is warn-only — nothing will auto-shut-down on a hot cell. Either
+recover laptop-3, or treat physical battery removal as the real remediation and
+this watchdog as a smoke alarm that can only shout.
 
 ---
 
@@ -197,9 +212,10 @@ tier comments in `battery-watchdog`.
   exactly this "replay onto an existing node" purpose).
 - `laptop-6` runs at 76C, the hottest in the fleet, doing real work on WiFi with
   no ethernet. Worth checking its fan and vents while you're in there.
-- `zachd-ubuntu-laptop-1` is a 4 GB 2013 MacBook Air serving as an etcd voter.
-  Its battery is fine; the fragility is the role. Promoting `zachd-ubuntu-2`
-  (Mac mini, 6c/12t, 32 GB) to etcd and demoting it is worth doing regardless of
-  the battery work.
+- ~~`zachd-ubuntu-laptop-1` is a 4 GB 2013 MacBook Air serving as an etcd
+  voter.~~ Resolved 2026-08-21, though not as suggested: instead of promoting
+  `zachd-ubuntu-2`, an HP EliteDesk 800 G4 Mini and a Minisforum MS-A2 joined as
+  servers and both laptop control planes were demoted. laptop-1 was then retired
+  from the cluster outright. No laptop is a control plane now.
 - `debug.sh` reports SSH failures as `N/A` rather than an error, so a wrong
   `SSH_USER` produces a report that looks healthy and is entirely empty.
