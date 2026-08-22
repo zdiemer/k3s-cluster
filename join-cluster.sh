@@ -1224,13 +1224,57 @@ echo "Kubelet reservations: kube=$KUBE_RESERVED, system=$SYSTEM_RESERVED"
 # between servers") and it surfaces *after* the installer has already written
 # the unit file, so the node looks installed but crashloops. Copy the cluster's
 # values across before installing rather than discovering the mismatch after.
+#
+# The first version of this read the file with `sudo -S` and sent both the ssh
+# and the remote stderr to /dev/null, with `|| true` on the end. When sudo did
+# not work the block printed "control plane sets no critical config values",
+# the install proceeded, and zachd-ubuntu-5 crashlooped exactly like the bug
+# this was written to prevent — a silent success is worse than the failure it
+# hides. k3s writes config.yaml world-readable (0644), so no sudo is needed at
+# all; sudo is kept only as a fallback, and being unable to read the file is
+# now a hard stop rather than an empty string.
 if [ "$NODE_ROLE" = "server" ]; then
     echo "Replicating critical k3s config from the control plane..."
     CRITICAL_KEYS='cluster-domain|cluster-dns|cluster-cidr|service-cidr|disable-cni|disable-kube-proxy|disable-network-policy|disable-servicelb|disable-helm-controller|egress-selector-mode|secrets-encryption|flannel-backend|flannel-ipv6-masq|embedded-registry|supervisor-metrics'
-    CP_CONFIG=$(echo "$REMOTE_SUDO_PW" | ssh -o StrictHostKeyChecking=accept-new \
-        "$SSH_USER@$CONTROL_PLANE_IP" \
-        "sudo -S cat /etc/rancher/k3s/config.yaml /etc/rancher/k3s/config.yaml.d/*.yaml 2>/dev/null" 2>/dev/null \
-        | grep -E "^[[:space:]]*($CRITICAL_KEYS):" || true)
+    CP_CFG=/etc/rancher/k3s/config.yaml
+
+    # Distinguish "no config to copy" from "could not read it". Only the first
+    # is safe to proceed on. ssh stderr is deliberately NOT discarded.
+    CP_CFG_STATE=$(ssh -o StrictHostKeyChecking=accept-new "$SSH_USER@$CONTROL_PLANE_IP" \
+        "if [ ! -e $CP_CFG ]; then echo ABSENT; elif [ -r $CP_CFG ]; then echo READABLE; else echo DENIED; fi") \
+        || CP_CFG_STATE="SSHFAIL"
+    CP_CFG_STATE=$(echo "$CP_CFG_STATE" | tr -d '\r' | xargs)
+
+    CP_CONFIG=""
+    case "$CP_CFG_STATE" in
+        READABLE)
+            CP_CONFIG=$(ssh -o StrictHostKeyChecking=accept-new "$SSH_USER@$CONTROL_PLANE_IP" \
+                "cat $CP_CFG; cat /etc/rancher/k3s/config.yaml.d/*.yaml 2>/dev/null" \
+                | grep -E "^[[:space:]]*($CRITICAL_KEYS):" || true)
+            ;;
+        ABSENT)
+            echo "  Control plane has no $CP_CFG — nothing to replicate."
+            ;;
+        DENIED)
+            echo "  $CP_CFG is not readable as $SSH_USER — retrying with sudo..."
+            CP_CONFIG=$(echo "$REMOTE_SUDO_PW" | ssh -o StrictHostKeyChecking=accept-new \
+                "$SSH_USER@$CONTROL_PLANE_IP" \
+                "sudo -S sh -c 'cat $CP_CFG; cat /etc/rancher/k3s/config.yaml.d/*.yaml 2>/dev/null'" \
+                | grep -E "^[[:space:]]*($CRITICAL_KEYS):" || true)
+            if [ -z "$CP_CONFIG" ]; then
+                echo "Error: could not read the control plane's k3s config, with or without sudo."
+                echo "  Joining as a server without the cluster's critical values installs a node"
+                echo "  that crashloops on 'critical configuration value mismatch between servers'."
+                echo "  Copy $CP_CFG from $CONTROL_PLANE_HOSTNAME by hand, then re-run."
+                exit 1
+            fi
+            ;;
+        *)
+            echo "Error: could not reach $CONTROL_PLANE_HOSTNAME over SSH to read $CP_CFG."
+            echo "  Refusing to install a server that would crashloop on a config mismatch."
+            exit 1
+            ;;
+    esac
 
     mkdir -p /etc/rancher/k3s
     touch /etc/rancher/k3s/config.yaml
@@ -1245,7 +1289,7 @@ if [ "$NODE_ROLE" = "server" ]; then
                 echo "  + $cfgline"
             fi
         done <<< "$CP_CONFIG"
-    else
+    elif [ "$CP_CFG_STATE" = "READABLE" ]; then
         echo "  (control plane sets no critical config values)"
     fi
 fi
